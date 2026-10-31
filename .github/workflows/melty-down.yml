@@ -1,0 +1,38 @@
+name: Melty lab down
+run-name: Melty lab down (${{ inputs.name }})
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: Box name from melty-up (melty-lab-xxxxxx)
+        type: string
+        required: true
+
+concurrency:
+  group: melty-down-${{ inputs.name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  box:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: test-boxes
+    env:
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+      AZURE_CORE_COLLECT_TELEMETRY: 'false'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Lifecycle
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/melty-lab.py down
