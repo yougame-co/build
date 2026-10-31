@@ -43,7 +43,16 @@ def az(*args):
         if not code and re.search(r'(?i)usage error|unrecognized arguments|the following arguments are required|invalid choice', result.stderr or ''):
             code = re.search(r'(CliUsage)', 'CliUsage')
         code = next((g for g in code.groups() if g), None) if code else None
-        raise RuntimeError('Azure operation failed: ' + ' '.join(args[:2]) + (' [' + code + ']' if code else ''))
+        detail = ''
+        if args and args[0] == 'network':
+            # Network commands carry no secrets: show the CLI's own first error line, with every IP and GUID masked
+            # (yougame-lead 10-31: the failing nsg create never reached Azure, so the reason is client-side).
+            line = next((l for l in (result.stderr or '').splitlines() if l.strip()), '')
+            line = re.sub(r'\b\d{1,3}(?:\.\d{1,3}){3}(?:/\d{1,2})?\b', 'x.x.x.x', line)
+            line = re.sub(r'\b[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}\b', '<guid>', line)
+            line = re.sub(r'(?i)\b(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}\b', '<ipv6>', line)
+            detail = ' | ' + line[:300] if line else ''
+        raise RuntimeError('Azure operation failed: ' + ' '.join(args[:2]) + (' [' + code + ']' if code else '') + detail)
     return json.loads(result.stdout) if result.stdout.strip() else None
 
 
