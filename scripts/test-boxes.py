@@ -19,6 +19,9 @@ VM_TYPE = 'microsoft.compute/virtualmachines'
 DISK_TYPE = 'microsoft.compute/disks'
 
 
+SIZES = {'Standard_B2s', 'Standard_B4ms', 'Standard_D4s_v5', 'Standard_NC4as_T4_v3'}
+
+
 class ValidationError(Exception):
     pass
 
@@ -177,8 +180,9 @@ def up(inputs):
     if not re.fullmatch(r'(?:[1-9]|1[0-2])', str(hours)):
         raise ValidationError('hours must be an integer from 1 to 12')
     size, region = inputs.get('size', 'Standard_B2s'), inputs.get('region', 'eastus')
-    if not re.fullmatch(r'Standard_[A-Za-z0-9_]+', size) or not re.fullmatch(r'[a-z0-9]+', region):
-        raise ValidationError('Invalid size or region')
+    # Costed sizes only (security-lead 10-31): pay-as-you-go eastus ~$0.04-0.53/h; anything else needs a costed PR.
+    if size not in SIZES or not re.fullmatch(r'[a-z0-9]+', region):
+        raise ValidationError('Invalid size or region (sizes: ' + ', '.join(sorted(SIZES)) + ')')
     # Keep only key type/base64, never comments identifying its owner. Reject options.
     key_parts = key_file.read_text().strip().split()
     if len(key_file.read_text().strip().splitlines()) != 1 or len(key_parts) < 2:
