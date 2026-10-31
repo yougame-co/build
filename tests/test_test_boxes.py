@@ -1,3 +1,4 @@
+import base64
 """Offline safety/lifecycle checks; no Azure commands or real credentials."""
 import contextlib
 import datetime as dt
@@ -96,12 +97,16 @@ class LifecycleTests(unittest.TestCase):
                 disk = resource('ygbox-test-123-os', boxes.DISK_TYPE, box='ygbox-test-123')
                 calls = []
 
-                def fake_az(*args):
+                def fake_az(*args, timeout=None):
                     calls.append(args)
                     if args[:3] == ('network', 'public-ip', 'show'):
                         return {'ipAddress': '192.0.2.1'}
                     if args[:3] == ('vm', 'run-command', 'invoke'):
-                        return {'value': [{'message': 'guest failed' if fail_guest else 'YG_SSH_READY'}]}
+                        script = args[args.index('--scripts') + 1]
+                        if 'YG_SETUP_STARTED' in script:
+                            return {'value': [{'message': 'YG_SETUP_STARTED'}]}
+                        tail = 'YG_FAIL host keys' if fail_guest else 'YG_SSH_READY'
+                        return {'value': [{'message': '[+0s] start\n[+4s] host keys\nC:\\Users\\x 10.1.2.3\n' + tail}]}
                     if args[:2] == ('vm', 'get-instance-view'):
                         return {'instanceView': {'vmAgent': {'statuses': [{'displayStatus': 'Ready'}]}}}
                     return {}
@@ -109,10 +114,11 @@ class LifecycleTests(unittest.TestCase):
                 old = os.getcwd()
                 try:
                     os.chdir(root)
-                    with patch.dict(os.environ, {'GITHUB_RUN_ID': '123', 'AZURE_RESOURCE_GROUP': 'mock', 'GITHUB_OUTPUT': str(root/'output'), 'GITHUB_STEP_SUMMARY': str(root/'summary')}), patch.object(boxes, 'login'), patch.object(boxes, 'az', side_effect=fake_az), patch.object(boxes, 'inventory', side_effect=[[], [vm, disk], [vm, disk]]), contextlib.redirect_stdout(io.StringIO()):
+                    out = io.StringIO()
+                    with patch.dict(os.environ, {'GITHUB_RUN_ID': '123', 'AZURE_RESOURCE_GROUP': 'mock', 'GITHUB_OUTPUT': str(root/'output'), 'GITHUB_STEP_SUMMARY': str(root/'summary')}), patch.object(boxes, 'login'), patch.object(boxes, 'az', side_effect=fake_az), patch.object(boxes, 'inventory', side_effect=[[], [vm, disk], [vm, disk]]), patch.object(boxes.time, 'sleep'), contextlib.redirect_stdout(out):
                         inputs = {'label': 'test', 'os': os_name, 'allow_cidr': '8.8.8.8/32'}
                         if fail_guest:
-                            with self.assertRaisesRegex(RuntimeError, 'Windows SSH setup failed'):
+                            with self.assertRaisesRegex(RuntimeError, 'Windows SSH setup failed at host keys'):
                                 boxes.up(inputs)
                             self.assertFalse((root/'output').exists())
                             self.assertEqual([c[-1] for c in calls if c[:2] == ('resource', 'delete')], [vm['id'], disk['id']])
@@ -124,12 +130,20 @@ class LifecycleTests(unittest.TestCase):
                             self.assertIn(boxes.IMAGES[os_name], vm_call)
                             self.assertIn('Premium_LRS', vm_call)
                             self.assertEqual(any(c[:3] == ('vm', 'run-command', 'invoke') for c in calls), os_name.startswith('windows-'))
+                            if os_name.startswith('windows-'):
+                                launch = next(c for c in calls if c[:3] == ('vm', 'run-command', 'invoke'))
+                                payload = launch[launch.index('--scripts') + 1].split("FromBase64String('")[1].split("'")[0]
+                                self.assertIn('ssh-ed25519 AAAA', base64.b64decode(payload).decode())
+                                self.assertNotIn('synthetic-test', base64.b64decode(payload).decode())
+                                self.assertIn('guest: [+4s] host keys', out.getvalue())
                             self.assertEqual('--ssh-key-values' in vm_call, os_name == 'ubuntu-24.04')
                             rules = [c for c in calls if c[:4] == ('network', 'nsg', 'rule', 'create')]
                             self.assertEqual(len(rules), 3)
                             self.assertIn('Deny', rules[0])
                             self.assertIn('22', rules[1])
                             self.assertIn('51600-51699', rules[2])
+                        self.assertNotIn('10.1.2.3', out.getvalue())
+                        self.assertNotIn('Users', out.getvalue())
                 finally:
                     os.chdir(old)
 
@@ -148,6 +162,30 @@ class LifecycleTests(unittest.TestCase):
         with patch.object(boxes, 'az', return_value=never), patch.object(boxes.time, 'sleep'):
             with self.assertRaisesRegex(RuntimeError, 'Guest agent not ready: Not Ready'):
                 boxes.wait_guest_agent([], 'box', limit=-1)
+
+    def test_guest_setup_stuck_names_last_step_and_agent_wait_survives_one_error(self):
+        polls = iter(['[+0s] start\n[+2s] openssh capability'] * 5)
+
+        def fake_az(*args, timeout=None):
+            if args[:2] == ('vm', 'get-instance-view'):
+                return {'instanceView': {'vmAgent': {'statuses': [{'displayStatus': 'Ready'}]}}}
+            script = args[args.index('--scripts') + 1]
+            return {'value': [{'message': 'YG_SETUP_STARTED' if 'YG_SETUP_STARTED' in script else next(polls)}]}
+        out = io.StringIO()
+        with patch.object(boxes, 'az', side_effect=fake_az), patch.object(boxes.time, 'sleep'), contextlib.redirect_stdout(out):
+            with self.assertRaisesRegex(RuntimeError, 'stuck after: \\[\\+2s\\] openssh capability'):
+                boxes.guest_ssh_setup([], 'box', 'script', limit=-1)
+        self.assertIn('guest status: agent=Ready', out.getvalue())
+        calls = iter([RuntimeError('Azure operation failed: vm get-instance-view'),
+                      {'instanceView': {'vmAgent': {'statuses': [{'displayStatus': 'Ready'}]}}}])
+
+        def flaky(*args, timeout=None):
+            value = next(calls)
+            if isinstance(value, Exception):
+                raise value
+            return value
+        with patch.object(boxes, 'az', side_effect=flaky), patch.object(boxes.time, 'sleep'):
+            boxes.wait_guest_agent([], 'box')
 
     def test_default_os_is_windows_2025_and_unknown_os_refused(self):
         workflow = (Path(__file__).parents[1] / '.github/workflows/box-up.yml').read_text()
