@@ -45,7 +45,7 @@ class LifecycleTests(unittest.TestCase):
         orphan_disk = resource('ygbox-old-1-os', boxes.DISK_TYPE)
         orphan_disk['tags'] = None
         unrelated_disk = resource('ygbox-old-1-os', boxes.DISK_TYPE, owner='human')
-        with patch.object(boxes, 'inventory', return_value=[expired, ancient, fresh, other, missing, orphan_disk, unrelated_disk]), patch.object(boxes, 'delete_resources') as delete:
+        with patch.object(boxes, 'report_leftovers'), patch.object(boxes, 'inventory', return_value=[expired, ancient, fresh, other, missing, orphan_disk, unrelated_disk]), patch.object(boxes, 'delete_resources') as delete:
             boxes.reap(NOW)
         self.assertEqual(delete.call_args.args[0], [expired, ancient, missing, orphan_disk])
 
@@ -62,9 +62,30 @@ class LifecycleTests(unittest.TestCase):
         disk = resource('ygbox-test-1-os', boxes.DISK_TYPE)
         disk['tags'] = {}
         unrelated = resource('ygbox-another-2', box='ygbox-another-2')
-        with patch.object(boxes, 'inventory', return_value=[nic, vm, disk, unrelated]), patch.object(boxes, 'az') as az, contextlib.redirect_stdout(io.StringIO()):
+        with patch.object(boxes, 'report_leftovers'), patch.object(boxes, 'inventory', return_value=[nic, vm, disk, unrelated]), patch.object(boxes, 'az') as az, contextlib.redirect_stdout(io.StringIO()):
             boxes.down('ygbox-test-1')
         self.assertEqual([c.args[-1] for c in az.call_args_list], [vm['id'], nic['id'], disk['id']])
+
+    def test_down_reports_disks_and_snapshots_left_after_deletion(self):
+        vm = resource('ygbox-test-1', box='ygbox-test-1')
+        disk = resource('ygbox-test-1-os', boxes.DISK_TYPE)
+        snap = resource('someone-snap', boxes.SNAPSHOT_TYPE)
+        for after, line in (([[]], 'none'), ([[snap], [snap]], 'someone-snap'), ([[disk], []], 'none')):
+            out = io.StringIO()
+            with patch.object(boxes, 'inventory', side_effect=[[vm, disk], *after]), patch.object(boxes, 'az'), \
+                    patch.object(boxes.time, 'sleep'), contextlib.redirect_stdout(out):
+                boxes.down('ygbox-test-1')
+            self.assertIn('Disks and snapshots left in the group: ' + line + '\n', out.getvalue())
+
+    def test_down_fails_when_its_own_disk_or_snapshot_stays(self):
+        vm = resource('ygbox-test-1', box='ygbox-test-1')
+        disk = resource('ygbox-test-1-os', boxes.DISK_TYPE)
+        snap = resource('capture-x', boxes.SNAPSHOT_TYPE, box='ygbox-test-1')
+        for left in ([disk], [snap]):
+            with patch.object(boxes, 'inventory', side_effect=[[vm, disk], left, left]), patch.object(boxes, 'az'), \
+                    patch.object(boxes.time, 'sleep'), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(RuntimeError, 'left a disk or snapshot behind'):
+                    boxes.down('ygbox-test-1')
 
     def test_inventory_uses_server_creation_time_and_pagination(self):
         base = 'https://management.azure.com/subscriptions/sub/resourceGroups/group/resources'
