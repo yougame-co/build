@@ -38,7 +38,9 @@ def az(*args):
     if result.returncode:
         # Azure errors can repeat passwords, request bodies or network rules: keep only the error CODE
         # (letters only, e.g. AuthorizationFailed), which is safe for a public log.
-        code = re.search(r'\(([A-Za-z]{3,64})\)|"code":\s*"([A-Za-z]{3,64})"|Code: ([A-Za-z]{3,64})', result.stderr or '')
+        code = re.search(r'\(([A-Z][A-Za-z]{2,63})\)|"code":\s*"([A-Z][A-Za-z]{2,63})"|Code: ([A-Z][A-Za-z]{2,63})', result.stderr or '')
+        if not code and re.search(r'(?i)usage error|unrecognized arguments|the following arguments are required|invalid choice', result.stderr or ''):
+            code = re.search(r'(CliUsage)', 'CliUsage')
         code = next((g for g in code.groups() if g), None) if code else None
         raise RuntimeError('Azure operation failed: ' + ' '.join(args[:2]) + (' [' + code + ']' if code else ''))
     return json.loads(result.stdout) if result.stdout.strip() else None
