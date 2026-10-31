@@ -49,7 +49,8 @@ def az(*args):
             # (yougame-lead 10-31: the failing nsg create never reached Azure, so the reason is client-side).
             lines = [l for l in (result.stderr or '').splitlines() if l.strip()]
             # A CLI crash prints a traceback: its last line names the exception, which is what matters.
-            line = (lines[0] + ' ... ' + lines[-1]) if len(lines) > 1 and 'traceback' in lines[0].lower() else (lines[0] if lines else '')
+            exc = [l.strip() for l in lines if re.match(r'\s*[A-Za-z_.]*(?:Error|Exception)\b', l)]
+            line = ('CLI crash: ' + exc[-1]) if exc and 'traceback' in (lines[0] if lines else '').lower() else (lines[0] if lines else '')
             line = re.sub(r'\b\d{1,3}(?:\.\d{1,3}){3}(?:/\d{1,2})?\b', 'x.x.x.x', line)
             line = re.sub(r'\b[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}\b', '<guid>', line)
             line = re.sub(r'(?i)\b(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}\b', '<ipv6>', line)
@@ -58,8 +59,17 @@ def az(*args):
     return json.loads(result.stdout) if result.stdout.strip() else None
 
 
+def cli_version():
+    try:
+        v = az('version')
+        print('az CLI ' + str((v or {}).get('azure-cli', '?')))
+    except RuntimeError:
+        pass
+
+
 def login():
     mask(ADMIN)
+    cli_version()
     bearer = os.environ['ACTIONS_ID_TOKEN_REQUEST_TOKEN']
     mask(bearer)
     url = os.environ['ACTIONS_ID_TOKEN_REQUEST_URL']
