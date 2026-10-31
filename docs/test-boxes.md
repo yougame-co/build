@@ -21,7 +21,7 @@ that the supplied address belongs to you. Do not use a shared or broad CIDR.
 ```sh
 gh workflow run box-up.yml -R yougame-co/build --ref main \
   -f label=link-test -f allow_cidr=<their-IP>/32
-# Optional: -f os=ubuntu-24.04 -f size=Standard_B2s -f region=eastus -f hours=2
+# Optional: -f os=ubuntu-24.04 -f size=Standard_D2s_v5 -f region=eastus -f hours=2
 gh run list -R yougame-co/build --workflow box-up.yml
 gh run view <run-id> -R yougame-co/build --log
 ```
@@ -52,9 +52,9 @@ Ubuntu image has no additional workflow-managed guest firewall rules.
 Names are `ygbox-<label>-<run-id>`. Labels are 1-32 lowercase letters, numbers or
 hyphens with alphanumeric ends. A rerun cannot overwrite an existing box; tear
 it down first. GPU sizes are accepted, but fail until the subscription has quota
-and the requested region has capacity. A B2s is suitable for basic networking;
+and the requested region has capacity. A D2s_v5 is suitable for basic networking (B-series is capacity-blocked in eastus for this account, 10-31);
 GPU/game performance is a separate capacity decision. VMs explicitly use the
-Standard security type for compatibility with the default B2s size.
+Standard security type for compatibility with the default D2s_v5 size.
 
 Lifetime is 1-12 whole hours (default 2). The hourly reaper runs at minute 17,
 deleting expired `owner=agent` resources and resources at least 12 hours old,
@@ -107,3 +107,5 @@ these can keep accruing until resources are deleted. Other regions/sizes cost
 more or less. The resource group has a $200/month budget with alerts. Check
 [Azure pricing](https://azure.microsoft.com/en-us/pricing/calculator/) before
 requesting a larger or GPU machine.
+
+Allowed sizes (10-31, eastus capacity): Standard_D2s_v5, Standard_D4s_v5 (Windows/Linux x64), Standard_D4ps_v5 (ARM), Standard_NC4as_T4_v3 (GPU, needs quota). The B2s price table above is history; check current prices before a long run.

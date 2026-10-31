@@ -19,7 +19,7 @@ VM_TYPE = 'microsoft.compute/virtualmachines'
 DISK_TYPE = 'microsoft.compute/disks'
 
 
-SIZES = {'Standard_B2s', 'Standard_B4ms', 'Standard_D4s_v5', 'Standard_NC4as_T4_v3'}
+SIZES = {'Standard_D2s_v5', 'Standard_D4s_v5', 'Standard_D4ps_v5', 'Standard_NC4as_T4_v3'}
 
 
 class ValidationError(Exception):
@@ -184,7 +184,7 @@ def up(inputs):
     hours = inputs.get('hours', '2')
     if not re.fullmatch(r'(?:[1-9]|1[0-2])', str(hours)):
         raise ValidationError('hours must be an integer from 1 to 12')
-    size, region = inputs.get('size', 'Standard_B2s'), inputs.get('region', 'eastus')
+    size, region = inputs.get('size', 'Standard_D2s_v5'), inputs.get('region', 'eastus')
     # Costed sizes only (security-lead 10-31): pay-as-you-go eastus ~$0.04-0.53/h; anything else needs a costed PR.
     if size not in SIZES or not re.fullmatch(r'[a-z0-9]+', region):
         raise ValidationError('Invalid size or region (sizes: ' + ', '.join(sorted(SIZES)) + ')')
