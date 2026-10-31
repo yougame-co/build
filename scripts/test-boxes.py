@@ -109,6 +109,29 @@ def login():
     az('account', 'set', '--subscription', os.environ['AZURE_SUBSCRIPTION_ID'])
 
 
+def guest_status(rg, name):
+    # Fixed status words only (agent "Ready", extension provisioning codes); extension messages can carry script
+    # output, so they never reach the public log.
+    view = (az('vm', 'get-instance-view', *rg, '--name', name) or {}).get('instanceView') or {}
+    clean = lambda v: re.sub(r'[^A-Za-z/ ._-]', '', str(v))[:60]
+    agent = ','.join(clean(s.get('displayStatus', '')) for s in (view.get('vmAgent') or {}).get('statuses', []))
+    exts = ' '.join(clean(e.get('name', '?')) + '=' + ','.join(clean(s.get('code', '')) for s in e.get('statuses', []))
+                    for e in view.get('extensions') or [])
+    return agent, exts
+
+
+def wait_guest_agent(rg, name, limit=420):
+    # Run Command queues behind the guest agent; waiting here names a slow first boot instead of a silent timeout.
+    deadline = time.monotonic() + limit
+    while True:
+        agent, _ = guest_status(rg, name)
+        if agent == 'Ready':
+            return
+        if time.monotonic() > deadline:
+            raise RuntimeError('Guest agent not ready: ' + (agent or 'no status'))
+        time.sleep(15)
+
+
 def timestamp(value):
     if not value:
         return None
@@ -294,10 +317,19 @@ def up(inputs):
         disk = next(r for r in inventory() if r['name'] == name + '-os' and r['type'].lower() == DISK_TYPE)
         az('resource', 'tag', '--ids', disk['id'], '--tags', *tags)
         if windows:
+            step('guest agent')
+            wait_guest_agent(rg, name)
             step('guest ssh setup')
             script = Path('scripts/test-boxes-windows.ps1').read_text().replace('__PUBLIC_KEY__', key)
-            result = az('vm', 'run-command', 'invoke', *rg, '--name', name,
-                        '--command-id', 'RunPowerShellScript', '--scripts', script)
+            try:
+                result = az('vm', 'run-command', 'invoke', *rg, '--name', name,
+                            '--command-id', 'RunPowerShellScript', '--scripts', script)
+            except RuntimeError:
+                try:
+                    print('guest status: agent=%s extensions=%s' % guest_status(rg, name), flush=True)
+                except RuntimeError:
+                    pass
+                raise
             # Run Command can return CLI success even when the guest script fails.
             if not any('YG_SSH_READY' in v.get('message', '') for v in result.get('value', [])):
                 raise RuntimeError('Windows SSH setup failed')

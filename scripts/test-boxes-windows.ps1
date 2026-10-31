@@ -1,8 +1,12 @@
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-$capability = Get-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0'
-if ($capability.State -ne 'Installed') {
-    Add-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0' | Out-Null
+# Server 2025 ships sshd in the OS. Querying the Feature on Demand there can wait on Windows Update for the whole
+# Run Command (box run 41220876986 timed out after 15 min with no output), so only an image without sshd asks DISM.
+if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) {
+    $capability = Get-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0'
+    if ($capability.State -ne 'Installed') {
+        Add-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0' | Out-Null
+    }
 }
 # Generate host keys without starting the service with default authentication. On a fresh image sshd has
 # never run, so its ProgramData folder may not exist yet; private host keys get SYSTEM/Administrators-only ACLs.
