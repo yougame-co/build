@@ -66,6 +66,16 @@ class LifecycleTests(unittest.TestCase):
             boxes.down('ygbox-test-1')
         self.assertEqual([c.args[-1] for c in az.call_args_list], [vm['id'], nic['id'], disk['id']])
 
+    def test_down_reports_disks_and_snapshots_left_after_deletion(self):
+        vm = resource('ygbox-test-1', box='ygbox-test-1')
+        disk = resource('ygbox-test-1-os', boxes.DISK_TYPE)
+        snap = resource('someone-snap', boxes.SNAPSHOT_TYPE)
+        for after, line in (([], 'none'), ([snap, disk], 'someone-snap, ygbox-test-1-os')):
+            out = io.StringIO()
+            with patch.object(boxes, 'inventory', side_effect=[[vm, disk], after]), patch.object(boxes, 'az'), contextlib.redirect_stdout(out):
+                boxes.down('ygbox-test-1')
+            self.assertIn('Disks and snapshots left in the group: ' + line + '\n', out.getvalue())
+
     def test_inventory_uses_server_creation_time_and_pagination(self):
         base = 'https://management.azure.com/subscriptions/sub/resourceGroups/group/resources'
         with patch.dict(os.environ, {'AZURE_SUBSCRIPTION_ID': 'sub', 'AZURE_RESOURCE_GROUP': 'group'}), patch.object(boxes, 'az', side_effect=[{'value': [1], 'nextLink': base + '?page=2'}, {'value': [2]}]) as az:

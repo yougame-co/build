@@ -18,6 +18,7 @@ UTC = dt.timezone.utc
 ADMIN = 'ygagent'
 VM_TYPE = 'microsoft.compute/virtualmachines'
 DISK_TYPE = 'microsoft.compute/disks'
+SNAPSHOT_TYPE = 'microsoft.compute/snapshots'
 
 
 # Windows Server 2025 ships OpenSSH Server installed (only enabled by the guest script); 2022 downloads it as a
@@ -267,6 +268,7 @@ def down(name):
                 ((r.get('tags') or {}).get('box') == name or
                  (r['name'] == name and r['type'].lower() == VM_TYPE))]
     delete_resources(selected + disk_companions(resources, {name}))
+    report_leftovers()
 
 
 def reap(now=None):
@@ -291,6 +293,13 @@ def reap(now=None):
             if re.fullmatch(r'ygbox-[a-z0-9-]+-[0-9]+', box):
                 boxes.add(box)
     delete_resources(selected + disk_companions(resources, boxes))
+    report_leftovers()
+
+
+def report_leftovers():
+    # Compliance (10-31): a box that held a game disc must leave no disk or snapshot behind. Names only.
+    left = sorted(r['name'] for r in inventory() if r['type'].lower() in (DISK_TYPE, SNAPSHOT_TYPE))
+    print('Disks and snapshots left in the group: ' + (', '.join(left) if left else 'none'))
 
 
 def up(inputs):
