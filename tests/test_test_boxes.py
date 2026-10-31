@@ -102,6 +102,8 @@ class LifecycleTests(unittest.TestCase):
                         return {'ipAddress': '192.0.2.1'}
                     if args[:3] == ('vm', 'run-command', 'invoke'):
                         return {'value': [{'message': 'guest failed' if fail_guest else 'YG_SSH_READY'}]}
+                    if args[:2] == ('vm', 'get-instance-view'):
+                        return {'instanceView': {'vmAgent': {'statuses': [{'displayStatus': 'Ready'}]}}}
                     return {}
 
                 old = os.getcwd()
@@ -130,6 +132,22 @@ class LifecycleTests(unittest.TestCase):
                             self.assertIn('51600-51699', rules[2])
                 finally:
                     os.chdir(old)
+
+    def test_guest_agent_wait_and_status_keep_only_fixed_words(self):
+        views = [{'instanceView': {'vmAgent': {'statuses': [{'displayStatus': 'Not Ready'}]}}},
+                 {'instanceView': {'vmAgent': {'statuses': [{'displayStatus': 'Ready'}]},
+                                   'extensions': [{'name': 'RunCommandWindows', 'statuses': [
+                                       {'code': 'ProvisioningState/transitioning', 'message': 'secret 10.0.0.4 output'}]}]}}]
+        with patch.object(boxes, 'az', side_effect=views + views[1:]), patch.object(boxes.time, 'sleep') as sleep:
+            boxes.wait_guest_agent([], 'box')
+            self.assertEqual(sleep.call_count, 1)
+            agent, exts = boxes.guest_status([], 'box')
+        self.assertEqual(agent, 'Ready')
+        self.assertEqual(exts, 'RunCommandWindows=ProvisioningState/transitioning')
+        never = {'instanceView': {'vmAgent': {'statuses': [{'displayStatus': 'Not Ready'}]}}}
+        with patch.object(boxes, 'az', return_value=never), patch.object(boxes.time, 'sleep'):
+            with self.assertRaisesRegex(RuntimeError, 'Guest agent not ready: Not Ready'):
+                boxes.wait_guest_agent([], 'box', limit=-1)
 
     def test_default_os_is_windows_2025_and_unknown_os_refused(self):
         workflow = (Path(__file__).parents[1] / '.github/workflows/box-up.yml').read_text()
