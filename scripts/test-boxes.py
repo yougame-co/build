@@ -34,8 +34,14 @@ def mask(value):
 
 
 def az(*args):
-    result = subprocess.run(['az', *args, '--only-show-errors', '--output', 'json'],
-                            capture_output=True, text=True, check=False)
+    # az 2.91 can crash with an import deadlock (_DeadlockError on requests.structures) when its telemetry thread
+    # imports at the same time: telemetry off, and one retry on exactly that crash (box run 41177256736).
+    env = {**os.environ, 'AZURE_CORE_COLLECT_TELEMETRY': 'false'}
+    for attempt in range(3):
+        result = subprocess.run(['az', *args, '--only-show-errors', '--output', 'json'],
+                                capture_output=True, text=True, check=False, env=env)
+        if not (result.returncode and '_DeadlockError' in (result.stderr or '')):
+            break
     if result.returncode:
         # Azure errors can repeat passwords, request bodies or network rules: keep only the error CODE
         # (letters only, e.g. AuthorizationFailed), which is safe for a public log.
