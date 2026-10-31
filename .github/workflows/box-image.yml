@@ -28,7 +28,7 @@ permissions:
 jobs:
   box:
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 120
     environment: test-boxes
     env:
       AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}

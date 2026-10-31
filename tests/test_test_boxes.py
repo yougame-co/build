@@ -30,7 +30,7 @@ def resource(name, kind=boxes.VM_TYPE, **tags):
 
 class LifecycleTests(unittest.TestCase):
     @contextlib.contextmanager
-    def capture_case(self, missing=(), scan='YG_NO_DISC', stderr='', entries=None,
+    def capture_case(self, missing=(), scan='YG_NO_DISC', stderr='', polls=None,
                      data_disks=(), fail_version=False, items=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -38,6 +38,11 @@ class LifecycleTests(unittest.TestCase):
             vm['location'] = 'eastus'
             calls = []
             version = []
+            clock = [0]
+            poll_results = iter(polls) if polls is not None else None
+
+            def sleep(seconds):
+                clock[0] += seconds
 
             def fake_az(*args, timeout=None):
                 calls.append(args)
@@ -46,9 +51,15 @@ class LifecycleTests(unittest.TestCase):
                 if args[:2] == ('vm', 'get-instance-view'):
                     return {'instanceView': {'vmAgent': {'statuses': [{'displayStatus': 'Ready'}]}}}
                 if args[:3] == ('vm', 'run-command', 'invoke'):
-                    self.assertEqual(timeout, 900)
-                    return {'value': entries if entries is not None else [
-                        {'code': 'ComponentStatus/StdOut/succeeded', 'message': scan},
+                    self.assertEqual(timeout, 300)
+                    script = args[args.index('--scripts') + 1]
+                    if 'YG_TASK_STARTED' in script:
+                        return {'value': [{'message': 'YG_TASK_STARTED'}]}
+                    if script.startswith('Unregister-ScheduledTask'):
+                        return {}
+                    self.assertEqual(script, boxes.POLL.replace('__RESULT_FILE__', 'disc-scan.txt'))
+                    return {'value': [
+                        {'code': 'ComponentStatus/StdOut/succeeded', 'message': next(poll_results) if poll_results is not None else scan},
                         {'code': 'ComponentStatus/StdErr/succeeded', 'message': stderr}]}
                 if args[:2] == ('sig', 'show'):
                     if 'gallery' in missing:
@@ -74,7 +85,7 @@ class LifecycleTests(unittest.TestCase):
 
             env = {'GITHUB_RUN_ID': '123', 'AZURE_RESOURCE_GROUP': 'mock',
                    'GITHUB_OUTPUT': str(root/'output'), 'GITHUB_STEP_SUMMARY': str(root/'summary')}
-            with patch.dict(os.environ, env), patch.object(boxes, 'login') as login, patch.object(boxes, 'az', side_effect=fake_az), patch.object(boxes, 'inventory', return_value=[vm] if items is None else items), patch.object(boxes.dt, 'datetime', CaptureTime), patch.object(boxes.time, 'sleep'), contextlib.redirect_stdout(io.StringIO()) as output:
+            with patch.dict(os.environ, env), patch.object(boxes, 'login') as login, patch.object(boxes, 'az', side_effect=fake_az), patch.object(boxes, 'inventory', return_value=[vm] if items is None else items), patch.object(boxes.dt, 'datetime', CaptureTime), patch.object(boxes.time, 'monotonic', side_effect=lambda: clock[0]), patch.object(boxes.time, 'sleep', side_effect=sleep), patch.object(boxes, 'STARTED', 0), contextlib.redirect_stdout(io.StringIO()) as output:
                 yield root, calls, vm, version, login, output
 
     def test_capture_validates_before_login(self):
@@ -103,15 +114,15 @@ class LifecycleTests(unittest.TestCase):
 
     def test_capture_disc_guard_fails_before_deallocation(self):
         for scan, stderr in [('x YG_NO_DISC', ''), ('YG_NO_DISC\nmore', ''),
-                             ('YG_NO_DISC', 'private-scan-detail'), ('YG_NO_DISC', '\n'),
+                             ('YG_NO_DISC', 'private-scan-detail'),
                              ('YG_SCAN_ERROR 1 0', ''), ('YG_DISC_FOUND 0 1', ''),
                              ('YG_DISC_FOUND 1 0 private-scan-detail', ''),
                              ('', ''), ('private-scan-detail', '')]:
             with self.subTest(scan=scan, stderr=stderr), self.capture_case(scan=scan, stderr=stderr) as case:
                 with self.assertRaisesRegex(boxes.ValidationError, '^Refusing capture: guest disc scan did not report a clean disk$'):
                     boxes.capture({'name': 'ygbox-test-123', 'image': 'prepared', 'no_disc': 'yes'})
-                self.assertEqual([c[:2] for c in case[1]], [('vm', 'show'), ('vm', 'get-instance-view'),
-                                                           ('vm', 'run-command')])
+                self.assertEqual([c[:2] for c in case[1]][:2], [('vm', 'show'), ('vm', 'get-instance-view')])
+                self.assertTrue(all(c[:2] == ('vm', 'run-command') for c in case[1][2:]))
                 self.assertFalse((case[0]/'output').exists())
                 self.assertNotIn('private-scan-detail', case[5].getvalue())
                 expected = scan if scan in ('YG_SCAN_ERROR 1 0', 'YG_DISC_FOUND 0 1') else 'other'
@@ -119,29 +130,36 @@ class LifecycleTests(unittest.TestCase):
                     expected = 'YG_DISC_FOUND 1 0'
                 self.assertEqual(case[5].getvalue().splitlines()[-1], 'guest scan: ' + expected)
 
-    def test_capture_requires_exactly_one_stdout_and_stderr_entry(self):
-        stdout = {'code': 'ComponentStatus/StdOut/succeeded', 'message': 'YG_NO_DISC'}
-        stderr = {'code': 'ComponentStatus/StdErr/succeeded', 'message': ''}
-        for entries in [[], [stdout], [stderr], [stdout, stdout, stderr], [stdout, stderr, stderr],
-                        [stdout, stderr, {'code': 'other', 'message': ''}],
-                        [None, stderr], [stdout, {'code': None, 'message': ''}],
-                        [{'code': 'ComponentStatus/StdOut/failed', 'message': 'YG_NO_DISC'}, stderr],
-                        [{'message': 'YG_NO_DISC'}, stderr],
-                        [{'code': stdout['code']}, stderr],
-                        [stdout, {'code': stderr['code']}],
-                        [{'code': stdout['code'], 'message': None}, stderr]]:
-            with self.subTest(entries=entries), self.capture_case(entries=entries) as case:
+    def test_capture_requires_exactly_one_clean_result_line(self):
+        for scan in ['YG_NO_DISC\nYG_NO_DISC', 'YG_NO_LOG\nYG_NO_DISC', 'YG_NO_DISC\nYG_NO_LOG',
+                     'YG_NO_DISC\nYG_DISC_FOUND 1 0', 'prefix YG_NO_DISC', 'YG_NO_DISC_suffix']:
+            with self.subTest(scan=scan), self.capture_case(scan=scan) as case:
                 with self.assertRaisesRegex(boxes.ValidationError, 'guest disc scan did not report a clean disk'):
                     boxes.capture({'name': 'ygbox-test-123', 'image': 'prepared', 'no_disc': 'yes'})
                 self.assertFalse(any(c[:2] == ('vm', 'deallocate') for c in case[1]))
 
-    def test_capture_accepts_only_clean_stdout_and_empty_stderr_by_code(self):
-        for scan in ['YG_NO_DISC', ' \r\nYG_NO_DISC\r\n ']:
-            entries = [{'code': 'ComponentStatus/StdErr/succeeded', 'message': ''},
-                       {'code': 'ComponentStatus/StdOut/succeeded', 'message': scan}]
-            with self.subTest(scan=scan), self.capture_case(entries=entries) as case:
+    def test_capture_accepts_clean_result_with_blank_lines(self):
+        for scan in ['YG_NO_DISC', ' \r\nYG_NO_DISC\r\n ', '\n \tYG_NO_DISC \t\n\n']:
+            with self.subTest(scan=scan), self.capture_case(scan=scan) as case:
                 boxes.capture({'name': 'ygbox-test-123', 'image': 'prepared', 'no_disc': 'yes'})
                 self.assertTrue(any(c[:2] == ('vm', 'deallocate') for c in case[1]))
+
+    def test_capture_missing_result_file_polls_until_limit_then_refuses(self):
+        with self.capture_case(scan='YG_NO_LOG') as case:
+            with self.assertRaisesRegex(boxes.ValidationError, '^Refusing capture: guest disc scan did not report a clean disk$'):
+                boxes.capture({'name': 'ygbox-test-123', 'image': 'prepared', 'no_disc': 'yes'})
+            polls = [c for c in case[1] if c[-1] == boxes.POLL.replace('__RESULT_FILE__', 'disc-scan.txt')]
+            self.assertEqual(len(polls), 152)  # Ten-second polls through the 1500-second deadline.
+            self.assertFalse(any(c[:2] == ('vm', 'deallocate') for c in case[1]))
+            self.assertFalse(any(c[-1].startswith('Unregister-ScheduledTask') for c in case[1]))
+            self.assertEqual(case[5].getvalue().splitlines()[-1], 'guest scan: other')
+
+    def test_capture_waits_for_result_file_before_accepting_clean_scan(self):
+        with self.capture_case(polls=['YG_NO_LOG', 'YG_NO_LOG', 'YG_NO_DISC']) as case:
+            boxes.capture({'name': 'ygbox-test-123', 'image': 'prepared', 'no_disc': 'yes'})
+            polls = [c for c in case[1] if c[-1] == boxes.POLL.replace('__RESULT_FILE__', 'disc-scan.txt')]
+            self.assertEqual(len(polls), 3)
+            self.assertTrue(any(c[:2] == ('vm', 'deallocate') for c in case[1]))
 
     def test_capture_requires_image_builder_tag(self):
         for tags in [None, {}, {'image_builder': 'no'}, {'image_builder': 'YES'}]:
@@ -169,14 +187,17 @@ class LifecycleTests(unittest.TestCase):
                      '$systemFiles -notcontains $entry.FullName.ToLowerInvariant()',
                      'c:\\pagefile.sys', 'c:\\swapfile.sys', 'c:\\hiberfil.sys',
                      '} catch {\n        $errors++',
-                     "if ($errors -gt 0) { Write-Output ('YG_SCAN_ERROR '",
-                     "elseif ($found -gt 0) { Write-Output ('YG_DISC_FOUND '",
-                     "else { Write-Output 'YG_NO_DISC' }"]:
+                     "if ($errors -gt 0) { $result = 'YG_SCAN_ERROR '",
+                     "elseif ($found -gt 0) { $result = 'YG_DISC_FOUND '",
+                     "else { $result = 'YG_NO_DISC' }"]:
             self.assertIn(text, scan)
         for extension in ['.iso', '.gcm', '.rvz', '.ciso', '.wbfs', '.wia', '.gcz', '.nkit', '.dol', '.elf', '.rom']:
             self.assertIn("'" + extension + "'", scan)
         self.assertNotIn('SilentlyContinue', scan)
-        self.assertEqual(scan.count('Write-Output'), 3)
+        self.assertNotIn('Write-Output', scan)
+        self.assertEqual(scan.count('Set-Content'), 1)
+        self.assertEqual(scan.strip().splitlines()[-1],
+                         "Set-Content -Path 'C:\\yg\\disc-scan.txt' -Value $result -Encoding ascii")
 
     def test_capture_creates_specialized_image_and_keeps_newest_two(self):
         for missing in [(), ('gallery',), ('definition',), ('gallery', 'definition')]:
@@ -188,9 +209,11 @@ class LifecycleTests(unittest.TestCase):
                 self.assertEqual(sum(c[:2] == ('vm', 'show') for c in calls), 1)
                 self.assertEqual(calls[1][:2], ('vm', 'get-instance-view'))
                 self.assertEqual(calls[2][:3], ('vm', 'run-command', 'invoke'))
-                self.assertEqual(calls[2][-1], boxes.DISC_SCAN)
-                self.assertEqual(calls[3][:2], ('vm', 'deallocate'))
-                self.assertEqual(calls[4][:2], ('sig', 'show'))
+                self.assertIn("Start-ScheduledTask -TaskName 'YouGame-Disc-Scan'", calls[2][-1])
+                self.assertEqual(calls[3][-1], boxes.POLL.replace('__RESULT_FILE__', 'disc-scan.txt'))
+                self.assertEqual(calls[4][-1], boxes.UNREGISTER.replace('__TASK__', 'Disc-Scan'))
+                self.assertEqual(calls[5][:2], ('vm', 'deallocate'))
+                self.assertEqual(calls[6][:2], ('sig', 'show'))
                 self.assertEqual(sum(c[:2] == ('sig', 'create') for c in calls), int('gallery' in missing))
                 definitions = [c for c in calls if c[:3] == ('sig', 'image-definition', 'create')]
                 self.assertEqual(len(definitions), int('definition' in missing))
@@ -348,7 +371,7 @@ class LifecycleTests(unittest.TestCase):
                          capture.split('    env:\n')[1].split('    outputs:\n')[0])
         self.assertEqual(up.split('    steps:\n')[1].replace('test-boxes.py up', 'test-boxes.py capture'),
                          capture.split('    steps:\n')[1])
-        for text in ['timeout-minutes: 75', 'environment: test-boxes', 'contents: read',
+        for text in ['timeout-minutes: 120', 'environment: test-boxes', 'contents: read',
                      'id-token: write', "options: ['no', 'yes']", "default: 'no'"]:
             self.assertIn(text, capture)
         self.assertEqual(capture.split('on:\n')[1].split('\nconcurrency:')[0].splitlines()[0],
@@ -437,8 +460,8 @@ class LifecycleTests(unittest.TestCase):
                         return {'ipAddress': '192.0.2.1'}
                     if args[:3] == ('vm', 'run-command', 'invoke'):
                         script = args[args.index('--scripts') + 1]
-                        if 'YG_SETUP_STARTED' in script:
-                            return {'value': [{'message': 'YG_SETUP_STARTED'}]}
+                        if 'YG_TASK_STARTED' in script:
+                            return {'value': [{'message': 'YG_TASK_STARTED'}]}
                         tail = 'YG_FAIL host keys' if fail_guest else 'YG_SSH_READY'
                         return {'value': [{'message': '[+0s] start\n[+4s] host keys\nC:\\Users\\x 10.1.2.3\n' + tail}]}
                     if args[:2] == ('vm', 'get-instance-view'):
@@ -497,6 +520,70 @@ class LifecycleTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'Guest agent not ready: Not Ready'):
                 boxes.wait_guest_agent([], 'box', limit=-1)
 
+    def test_disc_scan_launcher_writes_script_and_registers_system_task(self):
+        with patch.object(boxes, 'run_command', side_effect=['YG_TASK_STARTED', 'YG_NO_DISC', '']) as run:
+            lines = boxes.guest_task([], 'box', 'Disc-Scan', boxes.DISC_SCAN, 'disc-scan.txt', 1500,
+                                     done=lambda lines: lines == ['YG_NO_DISC'])
+        self.assertEqual(lines, ['YG_NO_DISC'])
+        launch = run.call_args_list[0].args[2]
+        for text in [r"[IO.File]::WriteAllBytes('C:\yg\Disc-Scan.ps1'",
+                     r'-NoProfile -ExecutionPolicy Bypass -File C:\yg\Disc-Scan.ps1',
+                     "Register-ScheduledTask -TaskName 'YouGame-Disc-Scan'",
+                     "-User 'SYSTEM' -RunLevel Highest -Force",
+                     "Start-ScheduledTask -TaskName 'YouGame-Disc-Scan'",
+                     "Write-Output 'YG_TASK_STARTED'",
+                     r"& icacls.exe 'C:\yg' /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F'",
+                     r"Remove-Item 'C:\yg\disc-scan.txt' -Force -ErrorAction SilentlyContinue",
+                     r"if (Test-Path 'C:\yg\disc-scan.txt') { throw 'task result reset failed' }"]:
+            self.assertIn(text, launch)
+        self.assertLess(launch.index('Remove-Item'), launch.index('Start-ScheduledTask'))
+        payload = launch.split("FromBase64String('")[1].split("'")[0]
+        self.assertEqual(base64.b64decode(payload).decode(), boxes.DISC_SCAN)
+        self.assertEqual(run.call_args_list[1].args[2],
+                         r"if (Test-Path 'C:\yg\disc-scan.txt') { Get-Content 'C:\yg\disc-scan.txt' -Tail 40 } else { 'YG_NO_LOG' }")
+
+    def test_guest_task_unregisters_non_ssh_task_after_done(self):
+        outputs = ['YG_TASK_STARTED', 'YG_NO_LOG', 'working', ' \nYG_DONE\n ', '']
+        with patch.object(boxes, 'run_command', side_effect=outputs) as run, patch.object(boxes.time, 'sleep') as sleep:
+            lines = boxes.guest_task([], 'box', 'Disc-Scan', 'script', 'disc-scan.txt', 1500,
+                                     launch_timeout=17, poll_timeout=23, done=lambda lines: lines == ['YG_DONE'])
+        self.assertEqual(lines, ['YG_DONE'])
+        self.assertEqual(run.call_count, 5)
+        self.assertEqual(run.call_args_list[0].args[3], 17)
+        self.assertTrue(all(call.args[3] == 23 for call in run.call_args_list[1:]))
+        self.assertEqual([call.args for call in sleep.call_args_list], [(10,), (10,)])
+        self.assertEqual(run.call_args_list[-1].args,
+                         ([], 'box', "Unregister-ScheduledTask -TaskName 'YouGame-Disc-Scan' -Confirm:$false -ErrorAction SilentlyContinue", 23))
+        self.assertEqual(sum(call.args[2].startswith('Unregister-ScheduledTask') for call in run.call_args_list), 1)
+
+    def test_guest_task_validates_task_and_result_file_before_launch(self):
+        invalid = [(task, 'disc-scan.txt') for task in
+                   ['', 'x' * 41, 'Disc_Scan', 'Disc-Scan\n', '../Disc-Scan', "Disc';exit"]]
+        invalid += [('Disc-Scan', result) for result in
+                    ['', 'x' * 41 + '.txt', 'Disc-scan.txt', 'disc-scan.ps1', '../disc-scan.txt',
+                     'disc-scan.txt\n', 'disc_scan.txt', "scan.txt';exit"]]
+        with patch.object(boxes, 'run_command') as run:
+            for task, result in invalid:
+                with self.subTest(task=task, result=result), self.assertRaises(boxes.ValidationError):
+                    boxes.guest_task([], 'box', task, 'script', result, 1500, done=lambda lines: True)
+            run.assert_not_called()
+
+    def test_guest_task_requires_launch_token_before_polling(self):
+        with patch.object(boxes, 'run_command', return_value='') as run:
+            with self.assertRaisesRegex(RuntimeError, '^Guest task did not start$'):
+                boxes.guest_task([], 'box', 'Disc-Scan', 'script', 'disc-scan.txt', 1500,
+                                 done=lambda lines: True)
+        self.assertEqual(run.call_count, 1)
+
+    def test_guest_ssh_setup_start_failure_preserves_error_and_status(self):
+        out = io.StringIO()
+        with patch.object(boxes, 'run_command', return_value='') as run, patch.object(boxes, 'guest_status', return_value=('Ready', '')) as status, contextlib.redirect_stdout(out):
+            with self.assertRaisesRegex(RuntimeError, '^Windows SSH setup did not start$'):
+                boxes.guest_ssh_setup([], 'box', 'script')
+        self.assertEqual(run.call_count, 1)
+        status.assert_called_once_with([], 'box')
+        self.assertEqual(out.getvalue(), 'guest status: agent=Ready extensions=\n')
+
     def test_guest_setup_stuck_names_last_step_and_agent_wait_survives_one_error(self):
         polls = iter(['[+0s] start\n[+2s] openssh capability'] * 5)
 
@@ -504,7 +591,7 @@ class LifecycleTests(unittest.TestCase):
             if args[:2] == ('vm', 'get-instance-view'):
                 return {'instanceView': {'vmAgent': {'statuses': [{'displayStatus': 'Ready'}]}}}
             script = args[args.index('--scripts') + 1]
-            return {'value': [{'message': 'YG_SETUP_STARTED' if 'YG_SETUP_STARTED' in script else next(polls)}]}
+            return {'value': [{'message': 'YG_TASK_STARTED' if 'YG_TASK_STARTED' in script else next(polls)}]}
         out = io.StringIO()
         with patch.object(boxes, 'az', side_effect=fake_az), patch.object(boxes.time, 'sleep'), contextlib.redirect_stdout(out):
             with self.assertRaisesRegex(RuntimeError, 'stuck after: \\[\\+2s\\] openssh capability'):

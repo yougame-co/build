@@ -20,6 +20,8 @@ VM_TYPE = 'microsoft.compute/virtualmachines'
 DISK_TYPE = 'microsoft.compute/disks'
 GALLERY = 'yg_test_boxes'
 IMAGE_NAME = r'[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?'
+SSH_SETUP_TASK, SSH_SETUP_LOG = 'SSH-Setup', 'ssh-setup.log'
+DISC_SCAN_TASK, DISC_SCAN_RESULT = 'Disc-Scan', 'disc-scan.txt'
 DISC_SCAN = r"""
 $ErrorActionPreference = 'Stop'
 $extensions = @('.iso', '.gcm', '.rvz', '.ciso', '.wbfs', '.wia', '.gcz', '.nkit', '.dol', '.elf', '.rom')
@@ -46,9 +48,10 @@ while ($stack.Count -gt 0) {
         $errors++
     }
 }
-if ($errors -gt 0) { Write-Output ('YG_SCAN_ERROR ' + $errors + ' ' + $found) }
-elseif ($found -gt 0) { Write-Output ('YG_DISC_FOUND ' + $discCount + ' ' + $largeCount) }
-else { Write-Output 'YG_NO_DISC' }
+if ($errors -gt 0) { $result = 'YG_SCAN_ERROR ' + $errors + ' ' + $found }
+elseif ($found -gt 0) { $result = 'YG_DISC_FOUND ' + $discCount + ' ' + $largeCount }
+else { $result = 'YG_NO_DISC' }
+Set-Content -Path 'C:\yg\disc-scan.txt' -Value $result -Encoding ascii
 """
 
 
@@ -173,53 +176,85 @@ def wait_guest_agent(rg, name, limit=420):
         time.sleep(15)
 
 
-# The setup script runs as a SYSTEM scheduled task so Run Command returns at once: Run Command runs one script at a
+# Guest scripts run as SYSTEM scheduled tasks so Run Command returns at once: Run Command runs one script at a
 # time per VM, so a stuck script would also block any later read of its log. C:\yg is Administrators/SYSTEM only.
 LAUNCH = r'''$ErrorActionPreference = 'Stop'
 New-Item -ItemType Directory -Force -Path 'C:\yg' | Out-Null
 & icacls.exe 'C:\yg' /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'setup folder ACL failed' }
-[IO.File]::WriteAllBytes('C:\yg\ssh-setup.ps1', [Convert]::FromBase64String('__SCRIPT_B64__'))
-$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -ExecutionPolicy Bypass -File C:\yg\ssh-setup.ps1'
-Register-ScheduledTask -TaskName 'YouGame-SSH-Setup' -Action $action -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
-Start-ScheduledTask -TaskName 'YouGame-SSH-Setup'
-Write-Output 'YG_SETUP_STARTED'
+if ('__TASK__' -ne 'SSH-Setup') {
+    Remove-Item 'C:\yg\__RESULT_FILE__' -Force -ErrorAction SilentlyContinue
+    if (Test-Path 'C:\yg\__RESULT_FILE__') { throw 'task result reset failed' }
+}
+[IO.File]::WriteAllBytes('C:\yg\__TASK__.ps1', [Convert]::FromBase64String('__SCRIPT_B64__'))
+$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -ExecutionPolicy Bypass -File C:\yg\__TASK__.ps1'
+Register-ScheduledTask -TaskName 'YouGame-__TASK__' -Action $action -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
+Start-ScheduledTask -TaskName 'YouGame-__TASK__'
+Write-Output 'YG_TASK_STARTED'
 '''
-POLL = r'''if (Test-Path 'C:\yg\ssh-setup.log') { Get-Content 'C:\yg\ssh-setup.log' -Tail 40 } else { 'YG_NO_LOG' }'''
+POLL = r'''if (Test-Path 'C:\yg\__RESULT_FILE__') { Get-Content 'C:\yg\__RESULT_FILE__' -Tail 40 } else { 'YG_NO_LOG' }'''
+UNREGISTER = "Unregister-ScheduledTask -TaskName 'YouGame-__TASK__' -Confirm:$false -ErrorAction SilentlyContinue"
 # Only the setup script's own fixed lines reach the public log.
 SETUP_LINE = re.compile(r'\[\+\d{1,5}s\] [a-z ]{1,40}|YG_SSH_READY|YG_NO_LOG|YG_FAIL [a-z ]{1,40}')
 
 
-def run_command(rg, name, script, timeout, *, raw=False):
+def run_command(rg, name, script, timeout):
     result = az('vm', 'run-command', 'invoke', *rg, '--name', name,
                 '--command-id', 'RunPowerShellScript', '--scripts', script, timeout=timeout)
-    if raw:
-        return result
     return '\n'.join(v.get('message', '') for v in (result or {}).get('value', []))
 
 
-def guest_ssh_setup(rg, name, script, limit=600):
-    try:
-        started = run_command(rg, name, LAUNCH.replace('__SCRIPT_B64__', base64.b64encode(script.encode()).decode()), 300)
-        if 'YG_SETUP_STARTED' not in started:
-            raise RuntimeError('Windows SSH setup did not start')
+def guest_task(rg, name, task, script, result_file, limit, launch_timeout=300, poll_timeout=300, *, done):
+    """Launch a fixed guest task and pass stripped, nonblank result lines to done.
+
+    Return the last lines on completion or at the deadline; callers validate the result.
+    The polling limit starts after launch, and each Run Command has its own timeout.
+    """
+    if not re.fullmatch(r'[A-Za-z-]{1,40}', task):
+        raise ValidationError('Invalid guest task name')
+    if not re.fullmatch(r'[a-z-]{1,40}\.(log|txt)', result_file):
+        raise ValidationError('Invalid guest task result file')
+    launch = LAUNCH.replace('__TASK__', task).replace('__RESULT_FILE__', result_file)
+    launch = launch.replace('__SCRIPT_B64__', base64.b64encode(script.encode()).decode())
+    if 'YG_TASK_STARTED' not in run_command(rg, name, launch, launch_timeout):
+        raise RuntimeError('Windows SSH setup did not start' if task == SSH_SETUP_TASK else 'Guest task did not start')
+    if task == SSH_SETUP_TASK:
         step('guest setup started')
-        deadline, seen, last = time.monotonic() + limit, set(), 'no log'
-        while True:
-            lines = [l.strip() for l in run_command(rg, name, POLL, 300).splitlines()]
-            for line in lines:
-                if SETUP_LINE.fullmatch(line) and line not in seen:
-                    seen.add(line)
-                    print('guest: ' + line, flush=True)
-                    last = line
-            if 'YG_SSH_READY' in seen:
-                return
-            fail = next((l for l in seen if l.startswith('YG_FAIL ')), None)
-            if fail:
-                raise RuntimeError('Windows SSH setup failed at ' + fail.removeprefix('YG_FAIL '))
-            if time.monotonic() > deadline:
-                raise RuntimeError('Windows SSH setup stuck after: ' + last)
-            time.sleep(10)
+    poll = POLL.replace('__RESULT_FILE__', result_file)
+    deadline = time.monotonic() + limit
+    while True:
+        lines = [line.strip() for line in run_command(rg, name, poll, poll_timeout).splitlines() if line.strip()]
+        if done(lines):
+            # SSH setup unregisters itself in its own finally block.
+            if task != SSH_SETUP_TASK:
+                run_command(rg, name, UNREGISTER.replace('__TASK__', task), poll_timeout)
+            return lines
+        if time.monotonic() > deadline:
+            return lines
+        time.sleep(10)
+
+
+def guest_ssh_setup(rg, name, script, limit=600):
+    seen, last = set(), 'no log'
+
+    def done(lines):
+        nonlocal last
+        for line in lines:
+            if SETUP_LINE.fullmatch(line) and line not in seen:
+                seen.add(line)
+                print('guest: ' + line, flush=True)
+                last = line
+        if 'YG_SSH_READY' in seen:
+            return True
+        fail = next((l for l in seen if l.startswith('YG_FAIL ')), None)
+        if fail:
+            raise RuntimeError('Windows SSH setup failed at ' + fail.removeprefix('YG_FAIL '))
+        return False
+
+    try:
+        guest_task(rg, name, SSH_SETUP_TASK, script, SSH_SETUP_LOG, limit, done=done)
+        if 'YG_SSH_READY' not in seen:
+            raise RuntimeError('Windows SSH setup stuck after: ' + last)
     except RuntimeError:
         try:
             print('guest status: agent=%s extensions=%s' % guest_status(rg, name), flush=True)
@@ -358,18 +393,11 @@ def capture(inputs):
     step('guest agent')
     wait_guest_agent(rg, name)
     step('disc scan')
-    result = run_command(rg, name, DISC_SCAN, 900, raw=True)
-    values = result.get('value') if isinstance(result, dict) else None
-    values = values if isinstance(values, list) else []
-    entries = [v for v in values if isinstance(v, dict) and isinstance(v.get('code'), str)]
-    stdout = [v.get('message') for v in entries if 'StdOut' in v['code']]
-    stderr = [v.get('message') for v in entries if 'StdErr' in v['code']]
-    codes = {v['code'] for v in entries}
-    if (len(values) != 2 or codes != {'ComponentStatus/StdOut/succeeded', 'ComponentStatus/StdErr/succeeded'} or
-            len(stdout) != 1 or not isinstance(stdout[0], str) or stdout[0].strip() != 'YG_NO_DISC' or
-            stderr != ['']):
+    lines = guest_task(rg, name, DISC_SCAN_TASK, DISC_SCAN, DISC_SCAN_RESULT, 1500,
+                       done=lambda lines: bool(lines) and lines != ['YG_NO_LOG'])
+    if lines != ['YG_NO_DISC']:
         # Only fixed status words and numeric counts may reach the public log.
-        words = stdout[0].split() if stdout and isinstance(stdout[0], str) else []
+        words = lines[0].split() if lines else []
         status = words[0] if words and words[0] in ('YG_DISC_FOUND', 'YG_SCAN_ERROR') else 'other'
         counts = [v for v in words[1:3] if re.fullmatch(r'[0-9]+', v)]
         print('guest scan: ' + ' '.join([status, *counts]), flush=True)
