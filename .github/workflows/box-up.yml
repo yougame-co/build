@@ -1,0 +1,78 @@
+name: Test box up
+run-name: Test box up (${{ inputs.label }})
+on:
+  workflow_dispatch:
+    inputs:
+      label:
+        description: 'Purpose: 1-32 lowercase letters, digits, hyphens; alphanumeric ends'
+        required: true
+        type: string
+      os:
+        description: Operating system
+        type: choice
+        options: [windows-2022, ubuntu-24.04]
+        default: windows-2022
+      size:
+        description: Azure VM size (GPU requires available quota)
+        type: string
+        default: Standard_B2s
+      region:
+        description: Azure region
+        type: string
+        default: eastus
+      hours:
+        description: Lifetime in whole hours (1-12)
+        type: string
+        default: '2'
+      allow_cidr:
+        description: Your public IPv4 address followed by /32
+        type: string
+        required: true
+
+concurrency:
+  group: box-up-${{ inputs.label }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  box:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: test-boxes
+    env:
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+      AZURE_CORE_COLLECT_TELEMETRY: 'false'
+    outputs:
+      name: ${{ steps.box.outputs.name }}
+      public_ip: ${{ steps.box.outputs.public_ip }}
+      os: ${{ steps.box.outputs.os }}
+      expires: ${{ steps.box.outputs.expires }}
+    steps:
+      - name: Mask caller address before any other work
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYMASK'
+          import json, os
+          from pathlib import Path
+          value = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text()).get('inputs', {}).get('allow_cidr', '')
+          for item in (value, value.split('/')[0]):
+              if item:
+                  escaped = item.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+                  print('::add-mask::' + escaped, flush=True)
+          PYMASK
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Lifecycle
+        id: box
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/test-boxes.py up

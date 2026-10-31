@@ -28,7 +28,11 @@ A notice against an entry takes that entry down within 24 hours.
 
 ## Rules for workflows
 
-- Triggers: `workflow_dispatch` (and `workflow_call`), never `pull_request_target`.
+- Triggers: `workflow_dispatch`, `workflow_call`, and scheduled maintenance (`schedule`), never `pull_request_target`.
 - `permissions:` least privilege (`contents: read` unless a job needs more).
 - Only GitHub-owned actions (`actions/*`), pinned to full commit SHAs. `timeout-minutes` on every job.
 - Builds attest their outputs (GitHub artifact attestation) so YouGame can check an upload came from a run here.
+
+## Agent test boxes
+
+See [docs/test-boxes.md](docs/test-boxes.md) for Azure VM lifecycle workflows, access, cleanup and costs.
