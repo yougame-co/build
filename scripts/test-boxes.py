@@ -282,7 +282,7 @@ def reap(now=None):
         tags = (resource.get('tags') or {})
         expires = timestamp(tags.get('expires'))
         created = (timestamp(resource.get('createdTime')) or
-                   timestamp(resource.get('systemData', {}).get('createdAt')) or
+                   timestamp((resource.get('systemData') or {}).get('createdAt')) or
                    timestamp(tags.get('created')))
         # Fail closed for malformed/missing lifecycle timestamps. Server creation
         # time takes precedence so extending expires cannot bypass the 12h cap.
@@ -451,5 +451,11 @@ if __name__ == '__main__':
               + '; Azure details suppressed for public log privacy')
         sys.exit(1)
     except Exception as exc:
-        print('::error::Test box operation failed (' + type(exc).__name__ + '); details suppressed for public log privacy')
+        # The line number says where without printing any Azure data.
+        tb = exc.__traceback__
+        while tb and tb.tb_next:
+            tb = tb.tb_next
+        line = tb.tb_lineno if tb else 0
+        print('::error::Test box operation failed (' + type(exc).__name__ + ' at line ' + str(line)
+              + '); details suppressed for public log privacy')
         sys.exit(1)
