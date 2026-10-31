@@ -83,12 +83,17 @@ See [docs/test-boxes.md](docs/test-boxes.md) for Azure VM lifecycle workflows, a
 
 ## Images
 
-Prepare a Windows test box, then run `box-image.yml` with its `name` and an `image`
+Create a Windows test box with `image_builder=yes` in `box-up.yml`, prepare it,
+then run `box-image.yml` with its `name` and an `image`
 definition name to save its accounts, SSH setup, app and harness as a specialized
-image in the `yg_test_boxes` gallery. Capture refuses unless `no_disc=yes` and a
-guest scan finds no disc extensions or files larger than 1 GB in `C:\src`,
-`C:\Users` and `C:\ProgramData\YouGame*`. Remove every game disc and ROM before capture, and
-capture before anyone signs in on the box: an app session or token on the disk would be copied into every clone.
+image in the `yg_test_boxes` gallery. Capture requires the `image_builder=yes` tag
+set at box creation, the `no_disc=yes` confirmation, and no attached data disks.
+A guest scan walks all of `C:\`, skipping reparse points, and refuses capture on
+any enumeration error, disc extension, or file larger than 1 GB (except
+`C:\pagefile.sys`, `C:\swapfile.sys` and `C:\hiberfil.sys`).
+A disc or ROM must never be copied to an `image_builder` box: deleted disc bytes
+stay in the disk's free blocks, so a clean scan alone is not enough.
+Capture before anyone signs in on the box: an app session or token on the disk would be copied into every clone.
 The source box stays deallocated; run `box-down` to remove it, or let its expiry
 trigger cleanup.
 
@@ -97,3 +102,5 @@ Each successful capture keeps the newest two versions of that image definition.
 Standard_LRS snapshot storage for a 127 GB disk costs roughly $6/month per version.
 Set the optional `image` input in `box-up.yml` to clone the newest version; it
 overrides `os` and boots with the saved SSH setup, without Run Command.
+When the shared agent SSH key rotates, delete every image version: clones keep
+the old `authorized_keys` from the image.

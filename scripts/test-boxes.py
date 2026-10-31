@@ -21,17 +21,34 @@ DISK_TYPE = 'microsoft.compute/disks'
 GALLERY = 'yg_test_boxes'
 IMAGE_NAME = r'[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?'
 DISC_SCAN = r"""
-$extensions = @('.iso', '.gcm', '.rvz', '.ciso', '.wbfs', '.wia', '.gcz', '.nkit')
-$count = 0
-foreach ($root in @('C:\src', 'C:\Users', 'C:\ProgramData\YouGame*')) {
-    if (Test-Path -Path $root -ErrorAction SilentlyContinue) {
-        Get-ChildItem -Path $root -ErrorAction SilentlyContinue -Force -Recurse -File |
-            Where-Object { $extensions -contains $_.Extension -or $_.Length -gt 1GB } |
-            ForEach-Object { $count++ }
+$ErrorActionPreference = 'Stop'
+$extensions = @('.iso', '.gcm', '.rvz', '.ciso', '.wbfs', '.wia', '.gcz', '.nkit', '.dol', '.elf', '.rom')
+$systemFiles = @('c:\pagefile.sys', 'c:\swapfile.sys', 'c:\hiberfil.sys')
+$discCount, $largeCount, $found, $errors = 0, 0, 0, 0
+$stack = [System.Collections.Generic.Stack[string]]::new()
+$stack.Push('C:\')
+while ($stack.Count -gt 0) {
+    $dir = $stack.Pop()
+    try {
+        foreach ($entry in [System.IO.DirectoryInfo]::new($dir).EnumerateFileSystemInfos()) {
+            if ($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { continue }
+            if ($entry.Attributes -band [System.IO.FileAttributes]::Directory) {
+                $stack.Push($entry.FullName)
+            } else {
+                $disc = $extensions -contains $entry.Extension.ToLowerInvariant()
+                $large = $entry.Length -gt 1GB -and $systemFiles -notcontains $entry.FullName.ToLowerInvariant()
+                if ($disc) { $discCount++ }
+                if ($large) { $largeCount++ }
+                if ($disc -or $large) { $found++ }
+            }
+        }
+    } catch {
+        $errors++
     }
 }
-if ($count -eq 0) { Write-Output 'YG_NO_DISC' }
-else { Write-Output ('YG_DISC_FOUND ' + $count) }
+if ($errors -gt 0) { Write-Output ('YG_SCAN_ERROR ' + $errors + ' ' + $found) }
+elseif ($found -gt 0) { Write-Output ('YG_DISC_FOUND ' + $discCount + ' ' + $largeCount) }
+else { Write-Output 'YG_NO_DISC' }
 """
 
 
@@ -173,9 +190,11 @@ POLL = r'''if (Test-Path 'C:\yg\ssh-setup.log') { Get-Content 'C:\yg\ssh-setup.l
 SETUP_LINE = re.compile(r'\[\+\d{1,5}s\] [a-z ]{1,40}|YG_SSH_READY|YG_NO_LOG|YG_FAIL [a-z ]{1,40}')
 
 
-def run_command(rg, name, script, timeout):
+def run_command(rg, name, script, timeout, *, raw=False):
     result = az('vm', 'run-command', 'invoke', *rg, '--name', name,
                 '--command-id', 'RunPowerShellScript', '--scripts', script, timeout=timeout)
+    if raw:
+        return result
     return '\n'.join(v.get('message', '') for v in (result or {}).get('value', []))
 
 
@@ -330,14 +349,31 @@ def capture(inputs):
                r['type'].lower() == VM_TYPE and owned(r)), None)
     if vm is None:
         raise ValidationError('Refusing capture: VM must exist and have owner=agent')
+    if (vm.get('tags') or {}).get('image_builder') != 'yes':
+        raise ValidationError('Refusing capture: only a box created with image_builder=yes can be captured')
     rg = ['--resource-group', os.environ['AZURE_RESOURCE_GROUP']]
+    details = az('vm', 'show', *rg, '--name', name)
+    if (details.get('storageProfile') or {}).get('dataDisks'):
+        raise ValidationError('Refusing capture: data disks are not captured or cleaned')
     step('guest agent')
     wait_guest_agent(rg, name)
     step('disc scan')
-    result = az('vm', 'run-command', 'invoke', *rg, '--name', name,
-                '--command-id', 'RunPowerShellScript', '--scripts', DISC_SCAN)
-    if not any('YG_NO_DISC' in v.get('message', '') for v in (result or {}).get('value', [])):
-        raise ValidationError('Refusing capture: guest disc scan failed')
+    result = run_command(rg, name, DISC_SCAN, 900, raw=True)
+    values = result.get('value') if isinstance(result, dict) else None
+    values = values if isinstance(values, list) else []
+    entries = [v for v in values if isinstance(v, dict) and isinstance(v.get('code'), str)]
+    stdout = [v.get('message') for v in entries if 'StdOut' in v['code']]
+    stderr = [v.get('message') for v in entries if 'StdErr' in v['code']]
+    codes = {v['code'] for v in entries}
+    if (len(values) != 2 or codes != {'ComponentStatus/StdOut/succeeded', 'ComponentStatus/StdErr/succeeded'} or
+            len(stdout) != 1 or not isinstance(stdout[0], str) or stdout[0].strip() != 'YG_NO_DISC' or
+            stderr != ['']):
+        # Only fixed status words and numeric counts may reach the public log.
+        words = stdout[0].split() if stdout and isinstance(stdout[0], str) else []
+        status = words[0] if words and words[0] in ('YG_DISC_FOUND', 'YG_SCAN_ERROR') else 'other'
+        counts = [v for v in words[1:3] if re.fullmatch(r'[0-9]+', v)]
+        print('guest scan: ' + ' '.join([status, *counts]), flush=True)
+        raise ValidationError('Refusing capture: guest disc scan did not report a clean disk')
     step('deallocate')
     az('vm', 'deallocate', *rg, '--name', name)
     now = dt.datetime.now(UTC)
@@ -427,6 +463,8 @@ def up(inputs):
     tags = ['owner=agent', 'purpose=' + label, 'expires=' + expires,
             'run=' + os.environ['GITHUB_RUN_ID'], 'box=' + name,
             'created=' + now.strftime('%Y-%m-%dT%H:%M:%SZ')]
+    if inputs.get('image_builder') == 'yes':
+        tags.append('image_builder=yes')
     rg = ['--resource-group', os.environ['AZURE_RESOURCE_GROUP']]
     common = [*rg, '--location', region, '--tags', *tags]
     # A rerun must never reset/overwrite a live VM's password or SSH configuration.

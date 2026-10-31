@@ -17,6 +17,12 @@ on:
         type: string
         required: false
         default: ''
+      image_builder:
+        description: Prepare a box for image capture; never copy a disc or ROM to it
+        type: choice
+        required: false
+        options: ['no', 'yes']
+        default: 'no'
       size:
         description: Azure VM size (GPU requires available quota)
         type: string

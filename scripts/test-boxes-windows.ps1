@@ -63,15 +63,16 @@ Subsystem sftp sftp-server.exe
     }
     # Clones of a captured image would share these host keys. A startup task regenerates them whenever the box boots
     # on a different VM (SMBIOS UUID), then starts sshd; sshd itself stays Manual so it never serves the old key, and
-    # a failed regeneration leaves sshd without host keys, so it fails closed.
+    # a failed regeneration never starts sshd.
     Step 'host key task'
     @'
 $ErrorActionPreference = 'Stop'
 $marker = 'C:\yg\host-key-vm'
-$vm = (Get-CimInstance Win32_ComputerSystemProduct).UUID
 try {
+    $vm = (Get-CimInstance Win32_ComputerSystemProduct).UUID
+    if (-not $vm) { throw 'VM UUID missing' }
     if (-not (Test-Path $marker) -or (Get-Content $marker -Raw).Trim() -ne $vm) {
-        Stop-Service sshd -ErrorAction SilentlyContinue
+        Stop-Service sshd
         Remove-Item 'C:\ProgramData\ssh\ssh_host_*' -Force
         & "$env:WINDIR\System32\OpenSSH\ssh-keygen.exe" -A | Out-Null
         if ($LASTEXITCODE -ne 0) { throw 'host key generation failed' }
@@ -81,8 +82,13 @@ try {
         }
         Set-Content -Path $marker -Value $vm -Encoding ascii
     }
-} finally {
-    Start-Service sshd
+    if ((Test-Path $marker) -and (Get-Content $marker -Raw).Trim() -eq $vm) {
+        Start-Service sshd
+    } else {
+        exit 1
+    }
+} catch {
+    exit 1
 }
 '@ | Set-Content -Path 'C:\yg\ssh-hostkeys.ps1' -Encoding ascii
     Set-Content -Path 'C:\yg\host-key-vm' -Value (Get-CimInstance Win32_ComputerSystemProduct).UUID -Encoding ascii

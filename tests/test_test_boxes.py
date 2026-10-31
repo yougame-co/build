@@ -30,20 +30,26 @@ def resource(name, kind=boxes.VM_TYPE, **tags):
 
 class LifecycleTests(unittest.TestCase):
     @contextlib.contextmanager
-    def capture_case(self, missing=(), scan='YG_NO_DISC', fail_version=False, items=None):
+    def capture_case(self, missing=(), scan='YG_NO_DISC', stderr='', entries=None,
+                     data_disks=(), fail_version=False, items=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            vm = resource('ygbox-test-123', box='ygbox-test-123')
+            vm = resource('ygbox-test-123', box='ygbox-test-123', image_builder='yes')
             vm['location'] = 'eastus'
             calls = []
             version = []
 
-            def fake_az(*args):
+            def fake_az(*args, timeout=None):
                 calls.append(args)
+                if args[:2] == ('vm', 'show'):
+                    return {'storageProfile': {'dataDisks': list(data_disks)}}
                 if args[:2] == ('vm', 'get-instance-view'):
                     return {'instanceView': {'vmAgent': {'statuses': [{'displayStatus': 'Ready'}]}}}
                 if args[:3] == ('vm', 'run-command', 'invoke'):
-                    return {'value': [{'message': scan}]}
+                    self.assertEqual(timeout, 900)
+                    return {'value': entries if entries is not None else [
+                        {'code': 'ComponentStatus/StdOut/succeeded', 'message': scan},
+                        {'code': 'ComponentStatus/StdErr/succeeded', 'message': stderr}]}
                 if args[:2] == ('sig', 'show'):
                     if 'gallery' in missing:
                         raise RuntimeError('missing gallery')
@@ -96,12 +102,81 @@ class LifecycleTests(unittest.TestCase):
                 self.assertEqual(case[1], [])
 
     def test_capture_disc_guard_fails_before_deallocation(self):
-        for scan in ['YG_DISC_FOUND 2', '', 'guest script failed']:
-            with self.subTest(scan=scan), self.capture_case(scan=scan) as case:
-                with self.assertRaisesRegex(boxes.ValidationError, 'guest disc scan failed'):
+        for scan, stderr in [('x YG_NO_DISC', ''), ('YG_NO_DISC\nmore', ''),
+                             ('YG_NO_DISC', 'private-scan-detail'), ('YG_NO_DISC', '\n'),
+                             ('YG_SCAN_ERROR 1 0', ''), ('YG_DISC_FOUND 0 1', ''),
+                             ('YG_DISC_FOUND 1 0 private-scan-detail', ''),
+                             ('', ''), ('private-scan-detail', '')]:
+            with self.subTest(scan=scan, stderr=stderr), self.capture_case(scan=scan, stderr=stderr) as case:
+                with self.assertRaisesRegex(boxes.ValidationError, '^Refusing capture: guest disc scan did not report a clean disk$'):
                     boxes.capture({'name': 'ygbox-test-123', 'image': 'prepared', 'no_disc': 'yes'})
-                self.assertEqual([c[:2] for c in case[1]], [('vm', 'get-instance-view'), ('vm', 'run-command')])
+                self.assertEqual([c[:2] for c in case[1]], [('vm', 'show'), ('vm', 'get-instance-view'),
+                                                           ('vm', 'run-command')])
                 self.assertFalse((case[0]/'output').exists())
+                self.assertNotIn('private-scan-detail', case[5].getvalue())
+                expected = scan if scan in ('YG_SCAN_ERROR 1 0', 'YG_DISC_FOUND 0 1') else 'other'
+                if scan.startswith('YG_DISC_FOUND 1 0'):
+                    expected = 'YG_DISC_FOUND 1 0'
+                self.assertEqual(case[5].getvalue().splitlines()[-1], 'guest scan: ' + expected)
+
+    def test_capture_requires_exactly_one_stdout_and_stderr_entry(self):
+        stdout = {'code': 'ComponentStatus/StdOut/succeeded', 'message': 'YG_NO_DISC'}
+        stderr = {'code': 'ComponentStatus/StdErr/succeeded', 'message': ''}
+        for entries in [[], [stdout], [stderr], [stdout, stdout, stderr], [stdout, stderr, stderr],
+                        [stdout, stderr, {'code': 'other', 'message': ''}],
+                        [None, stderr], [stdout, {'code': None, 'message': ''}],
+                        [{'code': 'ComponentStatus/StdOut/failed', 'message': 'YG_NO_DISC'}, stderr],
+                        [{'message': 'YG_NO_DISC'}, stderr],
+                        [{'code': stdout['code']}, stderr],
+                        [stdout, {'code': stderr['code']}],
+                        [{'code': stdout['code'], 'message': None}, stderr]]:
+            with self.subTest(entries=entries), self.capture_case(entries=entries) as case:
+                with self.assertRaisesRegex(boxes.ValidationError, 'guest disc scan did not report a clean disk'):
+                    boxes.capture({'name': 'ygbox-test-123', 'image': 'prepared', 'no_disc': 'yes'})
+                self.assertFalse(any(c[:2] == ('vm', 'deallocate') for c in case[1]))
+
+    def test_capture_accepts_only_clean_stdout_and_empty_stderr_by_code(self):
+        for scan in ['YG_NO_DISC', ' \r\nYG_NO_DISC\r\n ']:
+            entries = [{'code': 'ComponentStatus/StdErr/succeeded', 'message': ''},
+                       {'code': 'ComponentStatus/StdOut/succeeded', 'message': scan}]
+            with self.subTest(scan=scan), self.capture_case(entries=entries) as case:
+                boxes.capture({'name': 'ygbox-test-123', 'image': 'prepared', 'no_disc': 'yes'})
+                self.assertTrue(any(c[:2] == ('vm', 'deallocate') for c in case[1]))
+
+    def test_capture_requires_image_builder_tag(self):
+        for tags in [None, {}, {'image_builder': 'no'}, {'image_builder': 'YES'}]:
+            with self.subTest(tags=tags), self.capture_case() as case:
+                vm = case[2]
+                vm['tags'] = {'owner': 'agent', **(tags or {})}
+                with self.assertRaisesRegex(boxes.ValidationError, '^Refusing capture: only a box created with image_builder=yes can be captured$'):
+                    boxes.capture({'name': vm['name'], 'image': 'prepared', 'no_disc': 'yes'})
+                self.assertEqual(case[1], [])
+                self.assertFalse((case[0]/'output').exists())
+
+    def test_capture_refuses_data_disks_before_scanning_or_deallocation(self):
+        with self.capture_case(data_disks=[{'name': 'data', 'lun': 0}]) as case:
+            with self.assertRaisesRegex(boxes.ValidationError, '^Refusing capture: data disks are not captured or cleaned$'):
+                boxes.capture({'name': 'ygbox-test-123', 'image': 'prepared', 'no_disc': 'yes'})
+            self.assertEqual([c[:2] for c in case[1]], [('vm', 'show')])
+            self.assertFalse((case[0]/'output').exists())
+
+    def test_disc_scan_walks_whole_os_volume_and_fails_closed(self):
+        scan = boxes.DISC_SCAN
+        for text in ["$ErrorActionPreference = 'Stop'", 'Stack[string]', "$stack.Push('C:\\')",
+                     '$stack.Pop()', '[System.IO.DirectoryInfo]::new($dir).EnumerateFileSystemInfos()',
+                     'if ($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { continue }',
+                     '$entry.Extension.ToLowerInvariant()', '$entry.Length -gt 1GB',
+                     '$systemFiles -notcontains $entry.FullName.ToLowerInvariant()',
+                     'c:\\pagefile.sys', 'c:\\swapfile.sys', 'c:\\hiberfil.sys',
+                     '} catch {\n        $errors++',
+                     "if ($errors -gt 0) { Write-Output ('YG_SCAN_ERROR '",
+                     "elseif ($found -gt 0) { Write-Output ('YG_DISC_FOUND '",
+                     "else { Write-Output 'YG_NO_DISC' }"]:
+            self.assertIn(text, scan)
+        for extension in ['.iso', '.gcm', '.rvz', '.ciso', '.wbfs', '.wia', '.gcz', '.nkit', '.dol', '.elf', '.rom']:
+            self.assertIn("'" + extension + "'", scan)
+        self.assertNotIn('SilentlyContinue', scan)
+        self.assertEqual(scan.count('Write-Output'), 3)
 
     def test_capture_creates_specialized_image_and_keeps_newest_two(self):
         for missing in [(), ('gallery',), ('definition',), ('gallery', 'definition')]:
@@ -109,17 +184,13 @@ class LifecycleTests(unittest.TestCase):
                 root, calls, vm, version, login, output = case
                 boxes.capture({'name': vm['name'], 'image': 'prepared', 'no_disc': 'yes'})
                 login.assert_called_once()
-                self.assertEqual(calls[0][:2], ('vm', 'get-instance-view'))
-                self.assertEqual(calls[1][:3], ('vm', 'run-command', 'invoke'))
-                scan = calls[1][-1]
-                for text in [r'C:\src', r'C:\Users', r'C:\ProgramData\YouGame*',
-                             '-ErrorAction SilentlyContinue', '-Force -Recurse -File',
-                             '1GB', 'YG_NO_DISC', 'YG_DISC_FOUND',
-                             '.iso', '.gcm', '.rvz', '.ciso', '.wbfs', '.wia', '.gcz', '.nkit']:
-                    self.assertIn(text, scan)
-                self.assertNotIn('FullName', scan)
-                self.assertEqual(calls[2][:2], ('vm', 'deallocate'))
-                self.assertEqual(calls[3][:2], ('sig', 'show'))
+                self.assertEqual(calls[0][:2], ('vm', 'show'))
+                self.assertEqual(sum(c[:2] == ('vm', 'show') for c in calls), 1)
+                self.assertEqual(calls[1][:2], ('vm', 'get-instance-view'))
+                self.assertEqual(calls[2][:3], ('vm', 'run-command', 'invoke'))
+                self.assertEqual(calls[2][-1], boxes.DISC_SCAN)
+                self.assertEqual(calls[3][:2], ('vm', 'deallocate'))
+                self.assertEqual(calls[4][:2], ('sig', 'show'))
                 self.assertEqual(sum(c[:2] == ('sig', 'create') for c in calls), int('gallery' in missing))
                 definitions = [c for c in calls if c[:3] == ('sig', 'image-definition', 'create')]
                 self.assertEqual(len(definitions), int('definition' in missing))
@@ -141,6 +212,7 @@ class LifecycleTests(unittest.TestCase):
                         self.assertIn(tag, call)
                     self.assertTrue(any(v.startswith('created=') for v in call))
                     self.assertNotIn('owner=agent', call)
+                    self.assertNotIn('image_builder=yes', call)
                 deleted = [c for c in calls if c[:3] == ('sig', 'image-version', 'delete')]
                 self.assertEqual([c[c.index('--gallery-image-version') + 1] for c in deleted],
                                  ['1.20260101.9', '1.20260101.10'])
@@ -214,6 +286,33 @@ class LifecycleTests(unittest.TestCase):
             self.assertIn('image prepared 1.20260101.11', output.getvalue())
             self.assertEqual(len([c for c in calls if c[:4] == ('network', 'nsg', 'rule', 'create')]), 3)
 
+    def test_up_image_builder_tags_all_box_resources_only_when_requested(self):
+        versions = [{'name': '1.20260101.1', 'id': '/mock/version/1'}]
+        for from_image in [False, True]:
+            for image_builder in [None, 'no', 'yes']:
+                with self.subTest(from_image=from_image, image_builder=image_builder), self.image_up_case(versions) as case:
+                    root, calls, inputs = case[:3]
+                    if not from_image:
+                        (root / 'keys').mkdir()
+                        (root / 'keys/agent-ssh.pub').write_text('ssh-ed25519 AAAA synthetic-test\n')
+                        inputs.update(image='', os='ubuntu-24.04')
+                    if image_builder is not None:
+                        inputs['image_builder'] = image_builder
+                    boxes.up(inputs)
+                    tagged = [c for c in calls if '--tags' in c]
+                    self.assertEqual(len(tagged), 6)
+                    tags = []
+                    for call in tagged:
+                        values = []
+                        for value in call[call.index('--tags') + 1:]:
+                            if value.startswith('--'):
+                                break
+                            values.append(value)
+                        tags.append(values)
+                        self.assertEqual('image_builder=yes' in values, image_builder == 'yes')
+                        self.assertNotIn('image_builder=no', values)
+                    self.assertTrue(all(values == tags[0] for values in tags))
+
     def test_up_image_without_versions_fails_before_creating_resources(self):
         with self.image_up_case([]) as case:
             with self.assertRaisesRegex(boxes.ValidationError, '^No image version for prepared$'):
@@ -254,6 +353,9 @@ class LifecycleTests(unittest.TestCase):
             self.assertIn(text, capture)
         self.assertEqual(capture.split('on:\n')[1].split('\nconcurrency:')[0].splitlines()[0],
                          '  workflow_dispatch:')
+        builder = up.split('      image_builder:\n')[1].split('      size:')[0]
+        for text in ['type: choice', 'required: false', "options: ['no', 'yes']", "default: 'no'"]:
+            self.assertIn(text, builder)
 
     def test_missing_key_fails_before_login(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(boxes, 'login') as login:
@@ -424,7 +526,13 @@ class LifecycleTests(unittest.TestCase):
         task = script.split("@'\n$ErrorActionPreference")[1].split("'@ | Set-Content -Path 'C:\\yg\\ssh-hostkeys.ps1'")[0]
         self.assertIn('Win32_ComputerSystemProduct', task)
         self.assertIn("Remove-Item 'C:\\ProgramData\\ssh\\ssh_host_*' -Force", task)
-        self.assertIn('finally {\n    Start-Service sshd', task)
+        self.assertNotIn('finally', task)
+        self.assertIn('Stop-Service sshd\n', task)
+        self.assertNotIn('SilentlyContinue', task)
+        self.assertIn("if ((Test-Path $marker) -and (Get-Content $marker -Raw).Trim() -eq $vm) {\n        Start-Service sshd\n    } else {\n        exit 1\n    }", task)
+        self.assertEqual(task.count('Start-Service sshd'), 1)
+        self.assertIn('} catch {\n    exit 1\n}', task)
+        self.assertLess(task.index('Set-Content -Path $marker -Value $vm'), task.index('Start-Service sshd'))
         self.assertIn('-StartupType Manual', script)
         self.assertNotIn('-StartupType Automatic', script)
         self.assertIn('New-ScheduledTaskTrigger -AtStartup', script)
