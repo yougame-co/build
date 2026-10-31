@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Azure test box lifecycle. CLI responses/errors stay private; no artifacts."""
+import base64
 import datetime as dt
 import ipaddress
 import json
@@ -47,11 +48,11 @@ def step(name):
     print('[+%ds] %s' % (time.monotonic() - STARTED, name), flush=True)
 
 
-def az(*args):
+def az(*args, timeout=None):
     # az 2.91 can crash with an import deadlock (_DeadlockError on requests.structures) when its telemetry thread
     # imports at the same time: telemetry off, and one retry on exactly that crash (box run 41177256736).
     env = {**os.environ, 'AZURE_CORE_COLLECT_TELEMETRY': 'false'}
-    limit = TIMEOUTS.get(tuple(args[:2]), 300)
+    limit = timeout or TIMEOUTS.get(tuple(args[:2]), 300)
     for attempt in range(3):
         try:
             result = subprocess.run(['az', *args, '--only-show-errors', '--output', 'json'],
@@ -122,14 +123,73 @@ def guest_status(rg, name):
 
 def wait_guest_agent(rg, name, limit=420):
     # Run Command queues behind the guest agent; waiting here names a slow first boot instead of a silent timeout.
+    # One failed status call is not a verdict: keep polling and report the last error only at the deadline.
     deadline = time.monotonic() + limit
     while True:
-        agent, _ = guest_status(rg, name)
+        try:
+            agent, error = guest_status(rg, name)[0], None
+        except RuntimeError as exc:
+            agent, error = '', exc
         if agent == 'Ready':
             return
         if time.monotonic() > deadline:
+            if error:
+                raise error
             raise RuntimeError('Guest agent not ready: ' + (agent or 'no status'))
         time.sleep(15)
+
+
+# The setup script runs as a SYSTEM scheduled task so Run Command returns at once: Run Command runs one script at a
+# time per VM, so a stuck script would also block any later read of its log. C:\yg is Administrators/SYSTEM only.
+LAUNCH = r'''$ErrorActionPreference = 'Stop'
+New-Item -ItemType Directory -Force -Path 'C:\yg' | Out-Null
+& icacls.exe 'C:\yg' /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'setup folder ACL failed' }
+[IO.File]::WriteAllBytes('C:\yg\ssh-setup.ps1', [Convert]::FromBase64String('__SCRIPT_B64__'))
+$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -ExecutionPolicy Bypass -File C:\yg\ssh-setup.ps1'
+Register-ScheduledTask -TaskName 'YouGame-SSH-Setup' -Action $action -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
+Start-ScheduledTask -TaskName 'YouGame-SSH-Setup'
+Write-Output 'YG_SETUP_STARTED'
+'''
+POLL = r'''if (Test-Path 'C:\yg\ssh-setup.log') { Get-Content 'C:\yg\ssh-setup.log' -Tail 40 } else { 'YG_NO_LOG' }'''
+# Only the setup script's own fixed lines reach the public log.
+SETUP_LINE = re.compile(r'\[\+\d{1,5}s\] [a-z ]{1,40}|YG_SSH_READY|YG_NO_LOG|YG_FAIL [a-z ]{1,40}')
+
+
+def run_command(rg, name, script, timeout):
+    result = az('vm', 'run-command', 'invoke', *rg, '--name', name,
+                '--command-id', 'RunPowerShellScript', '--scripts', script, timeout=timeout)
+    return '\n'.join(v.get('message', '') for v in (result or {}).get('value', []))
+
+
+def guest_ssh_setup(rg, name, script, limit=900):
+    try:
+        started = run_command(rg, name, LAUNCH.replace('__SCRIPT_B64__', base64.b64encode(script.encode()).decode()), 600)
+        if 'YG_SETUP_STARTED' not in started:
+            raise RuntimeError('Windows SSH setup did not start')
+        step('guest setup started')
+        deadline, seen, last = time.monotonic() + limit, set(), 'no log'
+        while True:
+            lines = [l.strip() for l in run_command(rg, name, POLL, 300).splitlines()]
+            for line in lines:
+                if SETUP_LINE.fullmatch(line) and line not in seen:
+                    seen.add(line)
+                    print('guest: ' + line, flush=True)
+                    last = line
+            if 'YG_SSH_READY' in seen:
+                return
+            fail = next((l for l in seen if l.startswith('YG_FAIL ')), None)
+            if fail:
+                raise RuntimeError('Windows SSH setup failed at ' + fail.removeprefix('YG_FAIL '))
+            if time.monotonic() > deadline:
+                raise RuntimeError('Windows SSH setup stuck after: ' + last)
+            time.sleep(10)
+    except RuntimeError:
+        try:
+            print('guest status: agent=%s extensions=%s' % guest_status(rg, name), flush=True)
+        except RuntimeError:
+            pass
+        raise
 
 
 def timestamp(value):
@@ -320,19 +380,7 @@ def up(inputs):
             step('guest agent')
             wait_guest_agent(rg, name)
             step('guest ssh setup')
-            script = Path('scripts/test-boxes-windows.ps1').read_text().replace('__PUBLIC_KEY__', key)
-            try:
-                result = az('vm', 'run-command', 'invoke', *rg, '--name', name,
-                            '--command-id', 'RunPowerShellScript', '--scripts', script)
-            except RuntimeError:
-                try:
-                    print('guest status: agent=%s extensions=%s' % guest_status(rg, name), flush=True)
-                except RuntimeError:
-                    pass
-                raise
-            # Run Command can return CLI success even when the guest script fails.
-            if not any('YG_SSH_READY' in v.get('message', '') for v in result.get('value', [])):
-                raise RuntimeError('Windows SSH setup failed')
+            guest_ssh_setup(rg, name, Path('scripts/test-boxes-windows.ps1').read_text().replace('__PUBLIC_KEY__', key))
         ip = az('network', 'public-ip', 'show', *rg, '--name', name + '-ip')['ipAddress']
         step('ready')
     except Exception:
