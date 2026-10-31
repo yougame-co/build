@@ -85,7 +85,7 @@ class LifecycleTests(unittest.TestCase):
                 boxes.az('vm', 'create', '--admin-password', 'synthetic-placeholder')
 
     def test_up_both_operating_systems_and_failed_guest_cleanup(self):
-        for os_name, fail_guest in [('windows-2022', False), ('ubuntu-24.04', False), ('windows-2022', True)]:
+        for os_name, fail_guest in [('windows-2025', False), ('windows-2022', False), ('ubuntu-24.04', False), ('windows-2025', True)]:
             with self.subTest(os=os_name, fail_guest=fail_guest), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 (root / 'keys').mkdir()
@@ -118,7 +118,10 @@ class LifecycleTests(unittest.TestCase):
                             boxes.up(inputs)
                             self.assertEqual(set(line.split('=')[0] for line in (root/'output').read_text().splitlines()), {'name', 'public_ip', 'os', 'expires'})
                             vm_call = next(c for c in calls if c[:2] == ('vm', 'create'))
-                            self.assertEqual('--admin-password' in vm_call, os_name == 'windows-2022')
+                            self.assertEqual('--admin-password' in vm_call, os_name.startswith('windows-'))
+                            self.assertIn(boxes.IMAGES[os_name], vm_call)
+                            self.assertIn('Premium_LRS', vm_call)
+                            self.assertEqual(any(c[:3] == ('vm', 'run-command', 'invoke') for c in calls), os_name.startswith('windows-'))
                             self.assertEqual('--ssh-key-values' in vm_call, os_name == 'ubuntu-24.04')
                             rules = [c for c in calls if c[:4] == ('network', 'nsg', 'rule', 'create')]
                             self.assertEqual(len(rules), 3)
@@ -127,6 +130,29 @@ class LifecycleTests(unittest.TestCase):
                             self.assertIn('51600-51699', rules[2])
                 finally:
                     os.chdir(old)
+
+    def test_default_os_is_windows_2025_and_unknown_os_refused(self):
+        workflow = (Path(__file__).parents[1] / '.github/workflows/box-up.yml').read_text()
+        self.assertIn('default: windows-2025', workflow)
+        self.assertIn('timeout-minutes: 50', workflow)
+        with tempfile.TemporaryDirectory() as directory:
+            old = os.getcwd()
+            try:
+                os.chdir(directory)
+                Path('keys').mkdir()
+                Path('keys/agent-ssh.pub').write_text('ssh-ed25519 AAAA synthetic-test\n')
+                with patch.object(boxes, 'login') as login, self.assertRaisesRegex(boxes.ValidationError, 'Invalid os'), contextlib.redirect_stdout(io.StringIO()):
+                    boxes.up({'label': 'test', 'os': 'windows-2019', 'allow_cidr': '8.8.8.8/32'})
+                login.assert_not_called()
+            finally:
+                os.chdir(old)
+
+    def test_stuck_cli_call_times_out_with_its_step_named(self):
+        with patch.object(boxes.subprocess, 'run', side_effect=boxes.subprocess.TimeoutExpired('az', 1)) as run:
+            with self.assertRaisesRegex(RuntimeError, r'^Azure operation failed: vm create \[Timeout\]$'):
+                boxes.az('vm', 'create', '--admin-password', 'synthetic-placeholder')
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.kwargs['timeout'], boxes.TIMEOUTS[('vm', 'create')])
 
     def test_mask_escapes_workflow_command_characters(self):
         output = io.StringIO()

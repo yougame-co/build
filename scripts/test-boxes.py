@@ -19,6 +19,15 @@ VM_TYPE = 'microsoft.compute/virtualmachines'
 DISK_TYPE = 'microsoft.compute/disks'
 
 
+# Windows Server 2025 ships OpenSSH Server installed (only enabled by the guest script); 2022 downloads it as a
+# Feature on Demand, which ran past the 30-min job limit on 10-31 (box run 41177326975).
+IMAGES = {'windows-2025': 'MicrosoftWindowsServer:WindowsServer:2025-datacenter-g2:latest',
+          'windows-2022': 'MicrosoftWindowsServer:WindowsServer:2022-datacenter-g2:latest',
+          'ubuntu-24.04': 'Canonical:ubuntu-24_04-lts:server:latest'}
+# Per-call client timeouts (seconds): a stuck call fails with its step named and cleanup still runs inside the job.
+TIMEOUTS = {('vm', 'create'): 1200, ('vm', 'run-command'): 900}
+STARTED = time.monotonic()
+
 SIZES = {'Standard_D2s_v6', 'Standard_D4s_v6', 'Standard_D2as_v7', 'Standard_D4as_v7',
          'Standard_D2ps_v6', 'Standard_D4ps_v6', 'Standard_NV4as_v4', 'Standard_NV8as_v4'}
 
@@ -33,13 +42,22 @@ def mask(value):
     print('::add-mask::' + value, flush=True)
 
 
+def step(name):
+    # Progress lines carry only fixed step names, so a slow step is visible in the public log.
+    print('[+%ds] %s' % (time.monotonic() - STARTED, name), flush=True)
+
+
 def az(*args):
     # az 2.91 can crash with an import deadlock (_DeadlockError on requests.structures) when its telemetry thread
     # imports at the same time: telemetry off, and one retry on exactly that crash (box run 41177256736).
     env = {**os.environ, 'AZURE_CORE_COLLECT_TELEMETRY': 'false'}
+    limit = TIMEOUTS.get(tuple(args[:2]), 300)
     for attempt in range(3):
-        result = subprocess.run(['az', *args, '--only-show-errors', '--output', 'json'],
-                                capture_output=True, text=True, check=False, env=env)
+        try:
+            result = subprocess.run(['az', *args, '--only-show-errors', '--output', 'json'],
+                                    capture_output=True, text=True, check=False, env=env, timeout=limit)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError('Azure operation failed: ' + ' '.join(args[:2]) + ' [Timeout]') from None
         if not (result.returncode and '_DeadlockError' in (result.stderr or '')):
             break
     if result.returncode:
@@ -206,8 +224,8 @@ def up(inputs):
     if network.version != 4 or network.prefixlen != 32 or not network.network_address.is_global:
         raise ValidationError('allow_cidr must be a public IPv4 address with /32')
     mask(str(network.network_address))
-    os_name = inputs.get('os', 'windows-2022')
-    if os_name not in ('windows-2022', 'ubuntu-24.04'):
+    os_name = inputs.get('os', 'windows-2025')
+    if os_name not in IMAGES:
         raise ValidationError('Invalid os')
     hours = inputs.get('hours', '2')
     if not re.fullmatch(r'(?:[1-9]|1[0-2])', str(hours)):
@@ -223,6 +241,7 @@ def up(inputs):
     if key_parts[0] not in ('ssh-ed25519', 'ssh-rsa') or not re.fullmatch(r'[A-Za-z0-9+/=]+', key_parts[1]):
         raise ValidationError('Invalid SSH public key')
     key = ' '.join(key_parts[:2])
+    step('login')
     login()
     name = 'ygbox-' + label + '-' + os.environ['GITHUB_RUN_ID']
     now = dt.datetime.now(UTC)
@@ -235,7 +254,9 @@ def up(inputs):
     # A rerun must never reset/overwrite a live VM's password or SSH configuration.
     if any(r['name'] == name for r in inventory()):
         raise ValidationError('Box already exists; use box-down before retrying')
+    windows = os_name.startswith('windows-')
     try:
+        step('network')
         az('network', 'nsg', 'create', '--name', name + '-nsg', *common)
         for rule, priority, protocol, ports, source, access in [
             ('deny-other-inbound', '4096', '*', '*', '*', 'Deny'),
@@ -258,21 +279,22 @@ def up(inputs):
         vm_args = ['vm', 'create', '--name', name, *common, '--size', size,
                    '--nics', name + '-nic', '--admin-username', ADMIN,
                    '--computer-name', 'ygbox' + os.environ['GITHUB_RUN_ID'][-10:],
-                   '--os-disk-name', name + '-os', '--storage-sku', 'Standard_LRS',
+                   '--os-disk-name', name + '-os', '--storage-sku', 'Premium_LRS',
                    '--security-type', 'Standard',
                    '--os-disk-delete-option', 'Detach', '--nic-delete-option', 'Detach']
-        if os_name == 'windows-2022':
+        vm_args += ['--image', IMAGES[os_name]]
+        if windows:
             password = 'Yg9!' + secrets.token_urlsafe(32)
             mask(password)
-            vm_args += ['--image', 'MicrosoftWindowsServer:WindowsServer:2022-datacenter-g2:latest',
-                        '--admin-password', password]
+            vm_args += ['--admin-password', password]
         else:
-            vm_args += ['--image', 'Canonical:ubuntu-24_04-lts:server:latest',
-                        '--authentication-type', 'ssh', '--ssh-key-values', str(key_file)]
+            vm_args += ['--authentication-type', 'ssh', '--ssh-key-values', str(key_file)]
+        step('vm create')
         az(*vm_args)
         disk = next(r for r in inventory() if r['name'] == name + '-os' and r['type'].lower() == DISK_TYPE)
         az('resource', 'tag', '--ids', disk['id'], '--tags', *tags)
-        if os_name == 'windows-2022':
+        if windows:
+            step('guest ssh setup')
             script = Path('scripts/test-boxes-windows.ps1').read_text().replace('__PUBLIC_KEY__', key)
             result = az('vm', 'run-command', 'invoke', *rg, '--name', name,
                         '--command-id', 'RunPowerShellScript', '--scripts', script)
@@ -280,8 +302,10 @@ def up(inputs):
             if not any('YG_SSH_READY' in v.get('message', '') for v in result.get('value', [])):
                 raise RuntimeError('Windows SSH setup failed')
         ip = az('network', 'public-ip', 'show', *rg, '--name', name + '-ip')['ipAddress']
+        step('ready')
     except Exception:
         # Delete even a partially provisioned VM and recover its untagged OS disk.
+        step('cleanup after failure')
         resources = inventory()
         selected = [r for r in resources if owned(r) and (r.get('tags') or {}).get('box') == name]
         delete_resources(selected + disk_companions(resources, {name}))

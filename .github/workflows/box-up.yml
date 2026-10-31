@@ -10,8 +10,8 @@ on:
       os:
         description: Operating system
         type: choice
-        options: [windows-2022, ubuntu-24.04]
-        default: windows-2022
+        options: [windows-2025, windows-2022, ubuntu-24.04]
+        default: windows-2025
       size:
         description: Azure VM size (GPU requires available quota)
         type: string
@@ -40,7 +40,7 @@ permissions:
 jobs:
   box:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 50
     environment: test-boxes
     env:
       AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
