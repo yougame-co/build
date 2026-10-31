@@ -15,7 +15,7 @@ on:
       size:
         description: Azure VM size (GPU requires available quota)
         type: string
-        default: Standard_D2s_v5
+        default: Standard_D2s_v6
       region:
         description: Azure region
         type: string

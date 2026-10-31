@@ -21,7 +21,7 @@ that the supplied address belongs to you. Do not use a shared or broad CIDR.
 ```sh
 gh workflow run box-up.yml -R yougame-co/build --ref main \
   -f label=link-test -f allow_cidr=<their-IP>/32
-# Optional: -f os=ubuntu-24.04 -f size=Standard_D2s_v5 -f region=eastus -f hours=2
+# Optional: -f os=ubuntu-24.04 -f size=Standard_D2s_v6 -f region=eastus -f hours=2
 gh run list -R yougame-co/build --workflow box-up.yml
 gh run view <run-id> -R yougame-co/build --log
 ```
@@ -109,3 +109,5 @@ more or less. The resource group has a $200/month budget with alerts. Check
 requesting a larger or GPU machine.
 
 Allowed sizes (10-31, eastus capacity): Standard_D2s_v5, Standard_D4s_v5 (Windows/Linux x64), Standard_D4ps_v5 (ARM), Standard_NC4as_T4_v3 (GPU, needs quota). The B2s price table above is history; check current prices before a long run.
+
+Allowed sizes from 10-31 2:24 AM (pay-as-you-go quota, 10 vCPU per family per US region): Standard_D2s_v6 (default) / D4s_v6, D2as_v7 / D4as_v7 (Windows/Linux x64), D2ps_v6 / D4ps_v6 (ARM; Windows 11 ARM64 image), NV4as_v4 / NV8as_v4 (AMD GPU slice, Windows). v5 families and NCasT4 need a support ticket.
