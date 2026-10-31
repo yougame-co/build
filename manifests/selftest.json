@@ -1,5 +1,1 @@
-{
-  "recipe": "selftest",
-  "repo": "https://github.com/yougame-co/build",
-  "sha": "0000000000000000000000000000000000000000"
-}
+{"recipe":"selftest","repo":"https://github.com/yougame-co/build","sha":"05c0bd409c18fa60c47c03a6b95adff5f278d5b3"}
