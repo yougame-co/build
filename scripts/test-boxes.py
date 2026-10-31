@@ -47,7 +47,9 @@ def az(*args):
         if args and args[0] == 'network':
             # Network commands carry no secrets: show the CLI's own first error line, with every IP and GUID masked
             # (yougame-lead 10-31: the failing nsg create never reached Azure, so the reason is client-side).
-            line = next((l for l in (result.stderr or '').splitlines() if l.strip()), '')
+            lines = [l for l in (result.stderr or '').splitlines() if l.strip()]
+            # A CLI crash prints a traceback: its last line names the exception, which is what matters.
+            line = (lines[0] + ' ... ' + lines[-1]) if len(lines) > 1 and 'traceback' in lines[0].lower() else (lines[0] if lines else '')
             line = re.sub(r'\b\d{1,3}(?:\.\d{1,3}){3}(?:/\d{1,2})?\b', 'x.x.x.x', line)
             line = re.sub(r'\b[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}\b', '<guid>', line)
             line = re.sub(r'(?i)\b(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}\b', '<ipv6>', line)
