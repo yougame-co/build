@@ -2,6 +2,7 @@
 """Azure test box lifecycle. CLI responses/errors stay private; no artifacts."""
 import base64
 import datetime as dt
+import gzip
 import ipaddress
 import json
 import os
@@ -26,7 +27,7 @@ IMAGES = {'windows-2025': 'MicrosoftWindowsServer:WindowsServer:2025-datacenter-
           'windows-2022': 'MicrosoftWindowsServer:WindowsServer:2022-datacenter-g2:latest',
           'ubuntu-24.04': 'Canonical:ubuntu-24_04-lts:server:latest'}
 # Per-call client timeouts (seconds): a stuck call fails with its step named and cleanup still runs inside the job.
-TIMEOUTS = {('vm', 'create'): 900, ('vm', 'run-command'): 900}
+TIMEOUTS = {('vm', 'create'): 900, ('vm', 'extension'): 900}
 STARTED = time.monotonic()
 
 SIZES = {'Standard_D2s_v6', 'Standard_D4s_v6', 'Standard_D2as_v7', 'Standard_D4as_v7',
@@ -139,57 +140,66 @@ def wait_guest_agent(rg, name, limit=420):
         time.sleep(15)
 
 
-# The setup script runs as a SYSTEM scheduled task so Run Command returns at once: Run Command runs one script at a
-# time per VM, so a stuck script would also block any later read of its log. C:\yg is Administrators/SYSTEM only.
-LAUNCH = r'''$ErrorActionPreference = 'Stop'
+# Guest scripts run through the Custom Script Extension. Run Command never reached the guest on these boxes (box
+# run 41223331751: agent Ready, no extension delivered in 15 min); a regular extension is part of the VM model and
+# reports its own status codes, so a stuck delivery is visible. C:\yg is Administrators/SYSTEM only.
+CSE = 'CustomScriptExtension'
+GUEST_WRAP = r"""$ErrorActionPreference = 'Stop'
 New-Item -ItemType Directory -Force -Path 'C:\yg' | Out-Null
 & icacls.exe 'C:\yg' /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'setup folder ACL failed' }
-[IO.File]::WriteAllBytes('C:\yg\ssh-setup.ps1', [Convert]::FromBase64String('__SCRIPT_B64__'))
-$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -ExecutionPolicy Bypass -File C:\yg\ssh-setup.ps1'
-Register-ScheduledTask -TaskName 'YouGame-SSH-Setup' -Action $action -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
-Start-ScheduledTask -TaskName 'YouGame-SSH-Setup'
-Write-Output 'YG_SETUP_STARTED'
-'''
-POLL = r'''if (Test-Path 'C:\yg\ssh-setup.log') { Get-Content 'C:\yg\ssh-setup.log' -Tail 40 } else { 'YG_NO_LOG' }'''
-# Only the setup script's own fixed lines reach the public log.
-SETUP_LINE = re.compile(r'\[\+\d{1,5}s\] [a-z ]{1,40}|YG_SSH_READY|YG_NO_LOG|YG_FAIL [a-z ]{1,40}')
+$packed = New-Object IO.MemoryStream (, [Convert]::FromBase64String('__SCRIPT_GZ__'))
+$unpacked = New-Object IO.MemoryStream
+(New-Object IO.Compression.GzipStream $packed, ([IO.Compression.CompressionMode]::Decompress)).CopyTo($unpacked)
+[IO.File]::WriteAllBytes('C:\yg\run.ps1', $unpacked.ToArray())
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'C:\yg\run.ps1'
+# __NONCE__
+"""
+# Only the guest scripts' own fixed lines reach the public log.
+SETUP_LINE = re.compile(r'\[\+\d{1,5}s\] [a-z ]{1,40}|YG_SSH_READY|YG_FAIL [a-z ]{1,40}')
 
 
-def run_command(rg, name, script, timeout):
-    result = az('vm', 'run-command', 'invoke', *rg, '--name', name,
-                '--command-id', 'RunPowerShellScript', '--scripts', script, timeout=timeout)
-    return '\n'.join(v.get('message', '') for v in (result or {}).get('value', []))
+def extension_view(rg, name):
+    # Status codes only (e.g. ProvisioningState/failed/3); messages can carry URLs or script output.
+    view = (az('vm', 'get-instance-view', *rg, '--name', name) or {}).get('instanceView') or {}
+    ext = next((e for e in view.get('extensions') or [] if e.get('name') == CSE), None)
+    if not ext:
+        return 'not delivered', ''
+    clean = lambda v: re.sub(r'[^A-Za-z0-9/ ._-]', '', str(v))[:60]
+    codes = ','.join(clean(s.get('code', '')) for s in ext.get('statuses', [])) or 'no status'
+    stdout = next((s.get('message', '') for s in ext.get('substatuses', [])
+                   if 'StdOut' in s.get('code', '')), '')
+    return codes, stdout
 
 
-def guest_ssh_setup(rg, name, script, limit=600):
+def guest_run(rg, name, script, timeout):
+    # The nonce changes the settings on every call, so the extension reruns instead of reporting a stale result.
+    packed = base64.b64encode(gzip.compress(script.encode())).decode()
+    command = GUEST_WRAP.replace('__SCRIPT_GZ__', packed).replace(
+        '__NONCE__', os.environ.get('GITHUB_RUN_ID', '0') + '-' + secrets.token_hex(4))
+    encoded = base64.b64encode(command.encode('utf-16-le')).decode()
+    settings = json.dumps({'commandToExecute': 'powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand ' + encoded})
     try:
-        started = run_command(rg, name, LAUNCH.replace('__SCRIPT_B64__', base64.b64encode(script.encode()).decode()), 300)
-        if 'YG_SETUP_STARTED' not in started:
-            raise RuntimeError('Windows SSH setup did not start')
-        step('guest setup started')
-        deadline, seen, last = time.monotonic() + limit, set(), 'no log'
-        while True:
-            lines = [l.strip() for l in run_command(rg, name, POLL, 300).splitlines()]
-            for line in lines:
-                if SETUP_LINE.fullmatch(line) and line not in seen:
-                    seen.add(line)
-                    print('guest: ' + line, flush=True)
-                    last = line
-            if 'YG_SSH_READY' in seen:
-                return
-            fail = next((l for l in seen if l.startswith('YG_FAIL ')), None)
-            if fail:
-                raise RuntimeError('Windows SSH setup failed at ' + fail.removeprefix('YG_FAIL '))
-            if time.monotonic() > deadline:
-                raise RuntimeError('Windows SSH setup stuck after: ' + last)
-            time.sleep(10)
+        az('vm', 'extension', 'set', *rg, '--vm-name', name, '--publisher', 'Microsoft.Compute',
+           '--name', CSE, '--version', '1.10', '--protected-settings', settings, timeout=timeout)
     except RuntimeError:
         try:
-            print('guest status: agent=%s extensions=%s' % guest_status(rg, name), flush=True)
+            print('guest extension: ' + extension_view(rg, name)[0], flush=True)
         except RuntimeError:
             pass
         raise
+    return extension_view(rg, name)[1]
+
+
+def guest_ssh_setup(rg, name, script):
+    lines = [l.strip() for l in guest_run(rg, name, script, 600).splitlines()]
+    for line in lines:
+        if SETUP_LINE.fullmatch(line):
+            print('guest: ' + line, flush=True)
+    if 'YG_SSH_READY' in lines:
+        return
+    fail = next((l for l in lines if SETUP_LINE.fullmatch(l) and l.startswith('YG_FAIL ')), None)
+    raise RuntimeError('Windows SSH setup failed at ' + (fail.removeprefix('YG_FAIL ') if fail else 'unknown step'))
 
 
 def timestamp(value):

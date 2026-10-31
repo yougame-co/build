@@ -1,13 +1,15 @@
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-# Runs as a SYSTEM scheduled task so Run Command returns at once. Every step is a fixed line in the log, which
-# box-up polls and prints, so a hang names its step (box run 41220876986 timed out silently after 15 min).
+# Runs through the Custom Script Extension as SYSTEM. Every step is a fixed line on stdout (box-up prints them) and
+# in C:\yg\ssh-setup.log, so a failure names its step.
 $log = 'C:\yg\ssh-setup.log'
 $started = Get-Date
 $current = 'start'
 function Step($name) {
     $script:current = $name
-    Add-Content -Path $log -Encoding ascii -Value ('[+{0}s] {1}' -f [int]((Get-Date) - $started).TotalSeconds, $name)
+    $line = '[+{0}s] {1}' -f [int]((Get-Date) - $started).TotalSeconds, $name
+    Add-Content -Path $log -Encoding ascii -Value $line
+    Write-Output $line
 }
 try {
     Step 'start'
@@ -66,9 +68,9 @@ Subsystem sftp sftp-server.exe
     Start-Service sshd
     if ((Get-Service sshd).Status -ne 'Running') { throw 'SSH did not start' }
     Add-Content -Path $log -Encoding ascii -Value 'YG_SSH_READY'
+    Write-Output 'YG_SSH_READY'
 } catch {
     # Only the step name: exception text can carry paths or addresses and the log is public.
     Add-Content -Path $log -Encoding ascii -Value ('YG_FAIL ' + $current)
-} finally {
-    Unregister-ScheduledTask -TaskName 'YouGame-SSH-Setup' -Confirm:$false -ErrorAction SilentlyContinue
+    Write-Output ('YG_FAIL ' + $current)
 }

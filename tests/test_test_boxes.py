@@ -1,9 +1,11 @@
-import base64
 """Offline safety/lifecycle checks; no Azure commands or real credentials."""
+import base64
 import contextlib
 import datetime as dt
+import gzip
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -101,14 +103,13 @@ class LifecycleTests(unittest.TestCase):
                     calls.append(args)
                     if args[:3] == ('network', 'public-ip', 'show'):
                         return {'ipAddress': '192.0.2.1'}
-                    if args[:3] == ('vm', 'run-command', 'invoke'):
-                        script = args[args.index('--scripts') + 1]
-                        if 'YG_SETUP_STARTED' in script:
-                            return {'value': [{'message': 'YG_SETUP_STARTED'}]}
-                        tail = 'YG_FAIL host keys' if fail_guest else 'YG_SSH_READY'
-                        return {'value': [{'message': '[+0s] start\n[+4s] host keys\nC:\\Users\\x 10.1.2.3\n' + tail}]}
                     if args[:2] == ('vm', 'get-instance-view'):
-                        return {'instanceView': {'vmAgent': {'statuses': [{'displayStatus': 'Ready'}]}}}
+                        tail = 'YG_FAIL host keys' if fail_guest else 'YG_SSH_READY'
+                        return {'instanceView': {'vmAgent': {'statuses': [{'displayStatus': 'Ready'}]}, 'extensions': [
+                            {'name': 'CustomScriptExtension', 'statuses': [{'code': 'ProvisioningState/succeeded'}],
+                             'substatuses': [{'code': 'ComponentStatus/StdOut/succeeded',
+                                              'message': '[+0s] start\n[+4s] host keys\nC:\\Users\\x 10.1.2.3\n' + tail},
+                                             {'code': 'ComponentStatus/StdErr/succeeded', 'message': 'secret 10.1.2.3'}]}]}}
                     return {}
 
                 old = os.getcwd()
@@ -129,12 +130,17 @@ class LifecycleTests(unittest.TestCase):
                             self.assertEqual('--admin-password' in vm_call, os_name.startswith('windows-'))
                             self.assertIn(boxes.IMAGES[os_name], vm_call)
                             self.assertIn('Premium_LRS', vm_call)
-                            self.assertEqual(any(c[:3] == ('vm', 'run-command', 'invoke') for c in calls), os_name.startswith('windows-'))
+                            self.assertFalse(any(c[:2] == ('vm', 'run-command') for c in calls))
+                            self.assertEqual(any(c[:3] == ('vm', 'extension', 'set') for c in calls), os_name.startswith('windows-'))
                             if os_name.startswith('windows-'):
-                                launch = next(c for c in calls if c[:3] == ('vm', 'run-command', 'invoke'))
-                                payload = launch[launch.index('--scripts') + 1].split("FromBase64String('")[1].split("'")[0]
-                                self.assertIn('ssh-ed25519 AAAA', base64.b64decode(payload).decode())
-                                self.assertNotIn('synthetic-test', base64.b64decode(payload).decode())
+                                ext = next(c for c in calls if c[:3] == ('vm', 'extension', 'set'))
+                                self.assertIn('CustomScriptExtension', ext)
+                                command = json.loads(ext[ext.index('--protected-settings') + 1])['commandToExecute']
+                                wrap = base64.b64decode(command.split('-EncodedCommand ')[1]).decode('utf-16-le')
+                                packed = wrap.split("FromBase64String('")[1].split("'")[0]
+                                setup = gzip.decompress(base64.b64decode(packed)).decode()
+                                self.assertIn('ssh-ed25519 AAAA', setup)
+                                self.assertNotIn('synthetic-test', setup)
                                 self.assertIn('guest: [+4s] host keys', out.getvalue())
                             self.assertEqual('--ssh-key-values' in vm_call, os_name == 'ubuntu-24.04')
                             rules = [c for c in calls if c[:4] == ('network', 'nsg', 'rule', 'create')]
@@ -163,19 +169,27 @@ class LifecycleTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'Guest agent not ready: Not Ready'):
                 boxes.wait_guest_agent([], 'box', limit=-1)
 
-    def test_guest_setup_stuck_names_last_step_and_agent_wait_survives_one_error(self):
-        polls = iter(['[+0s] start\n[+2s] openssh capability'] * 5)
-
-        def fake_az(*args, timeout=None):
-            if args[:2] == ('vm', 'get-instance-view'):
-                return {'instanceView': {'vmAgent': {'statuses': [{'displayStatus': 'Ready'}]}}}
-            script = args[args.index('--scripts') + 1]
-            return {'value': [{'message': 'YG_SETUP_STARTED' if 'YG_SETUP_STARTED' in script else next(polls)}]}
+    def test_stuck_extension_names_its_state_and_agent_wait_survives_one_error(self):
+        def stuck(*args, timeout=None):
+            if args[:3] == ('vm', 'extension', 'set'):
+                self.assertEqual(timeout, 600)
+                raise RuntimeError('Azure operation failed: vm extension [Timeout]')
+            return {'instanceView': {'extensions': [{'name': 'CustomScriptExtension', 'statuses': [
+                {'code': 'ProvisioningState/transitioning', 'message': 'https://x.blob/sas?sig=1'}]}]}}
         out = io.StringIO()
-        with patch.object(boxes, 'az', side_effect=fake_az), patch.object(boxes.time, 'sleep'), contextlib.redirect_stdout(out):
-            with self.assertRaisesRegex(RuntimeError, 'stuck after: \\[\\+2s\\] openssh capability'):
-                boxes.guest_ssh_setup([], 'box', 'script', limit=-1)
-        self.assertIn('guest status: agent=Ready', out.getvalue())
+        with patch.object(boxes, 'az', side_effect=stuck), contextlib.redirect_stdout(out):
+            with self.assertRaisesRegex(RuntimeError, 'Timeout'):
+                boxes.guest_ssh_setup([], 'box', 'script')
+        self.assertIn('guest extension: ProvisioningState/transitioning', out.getvalue())
+        self.assertNotIn('blob', out.getvalue())
+        with patch.object(boxes, 'az', return_value={'instanceView': {}}):
+            self.assertEqual(boxes.extension_view([], 'box'), ('not delivered', ''))
+        # A finished extension without YG_SSH_READY fails, naming the step only from a fixed line.
+        done = {'instanceView': {'extensions': [{'name': 'CustomScriptExtension', 'statuses': [], 'substatuses': [
+            {'code': 'ComponentStatus/StdOut/succeeded', 'message': '[+1s] start\nYG_FAIL C:/path 10.0.0.1'}]}]}}
+        with patch.object(boxes, 'az', return_value=done), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, 'failed at unknown step'):
+                boxes.guest_ssh_setup([], 'box', 'script')
         calls = iter([RuntimeError('Azure operation failed: vm get-instance-view'),
                       {'instanceView': {'vmAgent': {'statuses': [{'displayStatus': 'Ready'}]}}}])
 
