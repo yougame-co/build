@@ -290,6 +290,11 @@ if __name__ == '__main__':
     except ValidationError as exc:
         print('::error::' + str(exc))
         sys.exit(1)
-    except Exception:
-        print('::error::Test box operation failed; Azure details suppressed for public log privacy')
+    except RuntimeError as exc:
+        # az() messages carry only the operation (e.g. "account set"), never Azure's own text.
+        print('::error::Test box operation failed at ' + str(exc).removeprefix('Azure operation failed: ')
+              + '; Azure details suppressed for public log privacy')
+        sys.exit(1)
+    except Exception as exc:
+        print('::error::Test box operation failed (' + type(exc).__name__ + '); details suppressed for public log privacy')
         sys.exit(1)
