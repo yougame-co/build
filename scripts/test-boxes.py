@@ -268,7 +268,7 @@ def down(name):
                 ((r.get('tags') or {}).get('box') == name or
                  (r['name'] == name and r['type'].lower() == VM_TYPE))]
     delete_resources(selected + disk_companions(resources, {name}))
-    report_leftovers()
+    report_leftovers({name})
 
 
 def reap(now=None):
@@ -293,13 +293,22 @@ def reap(now=None):
             if re.fullmatch(r'ygbox-[a-z0-9-]+-[0-9]+', box):
                 boxes.add(box)
     delete_resources(selected + disk_companions(resources, boxes))
-    report_leftovers()
+    report_leftovers(boxes)
 
 
-def report_leftovers():
+def report_leftovers(boxes):
     # Compliance (10-31): a box that held a game disc must leave no disk or snapshot behind. Names only.
-    left = sorted(r['name'] for r in inventory() if r['type'].lower() in (DISK_TYPE, SNAPSHOT_TYPE))
-    print('Disks and snapshots left in the group: ' + (', '.join(left) if left else 'none'))
+    # The resource list can lag a delete by seconds, so anything left is read once more before it counts.
+    for attempt in range(2):
+        left = [r for r in inventory() if r['type'].lower() in (DISK_TYPE, SNAPSHOT_TYPE)]
+        if not left or attempt:
+            break
+        time.sleep(30)
+    print('Disks and snapshots left in the group: ' + (', '.join(sorted(r['name'] for r in left)) or 'none'))
+    stale = sorted(r['name'] for r in left if (r.get('tags') or {}).get('box') in boxes or
+                   any(r['name'].startswith(b + '-') for b in boxes))
+    if stale:
+        raise RuntimeError('A deleted box left a disk or snapshot behind: ' + ', '.join(stale))
 
 
 def up(inputs):
