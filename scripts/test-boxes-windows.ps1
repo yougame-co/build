@@ -61,8 +61,41 @@ Subsystem sftp sftp-server.exe
     if (-not (Get-NetFirewallRule -Name 'YouGame-Link' -ErrorAction SilentlyContinue)) {
         New-NetFirewallRule -Name 'YouGame-Link' -DisplayName 'YouGame Link' -Direction Inbound -Protocol UDP -LocalPort 51600-51699 -Action Allow | Out-Null
     }
+    # Clones of a captured image would share these host keys. A startup task regenerates them whenever the box boots
+    # on a different VM (SMBIOS UUID), then starts sshd; sshd itself stays Manual so it never serves the old key, and
+    # a failed regeneration never starts sshd.
+    Step 'host key task'
+    @'
+$ErrorActionPreference = 'Stop'
+$marker = 'C:\yg\host-key-vm'
+try {
+    $vm = (Get-CimInstance Win32_ComputerSystemProduct).UUID
+    if (-not $vm) { throw 'VM UUID missing' }
+    if (-not (Test-Path $marker) -or (Get-Content $marker -Raw).Trim() -ne $vm) {
+        Stop-Service sshd
+        Remove-Item 'C:\ProgramData\ssh\ssh_host_*' -Force
+        & "$env:WINDIR\System32\OpenSSH\ssh-keygen.exe" -A | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'host key generation failed' }
+        foreach ($hostKey in Get-ChildItem 'C:\ProgramData\ssh\ssh_host_*_key') {
+            & icacls.exe $hostKey.FullName /inheritance:r /grant:r '*S-1-5-32-544:F' '*S-1-5-18:F' | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'host key ACL failed' }
+        }
+        Set-Content -Path $marker -Value $vm -Encoding ascii
+    }
+    if ((Test-Path $marker) -and (Get-Content $marker -Raw).Trim() -eq $vm) {
+        Start-Service sshd
+    } else {
+        exit 1
+    }
+} catch {
+    exit 1
+}
+'@ | Set-Content -Path 'C:\yg\ssh-hostkeys.ps1' -Encoding ascii
+    Set-Content -Path 'C:\yg\host-key-vm' -Value (Get-CimInstance Win32_ComputerSystemProduct).UUID -Encoding ascii
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -ExecutionPolicy Bypass -File C:\yg\ssh-hostkeys.ps1'
+    Register-ScheduledTask -TaskName 'YouGame-SSH-HostKeys' -Action $action -Trigger (New-ScheduledTaskTrigger -AtStartup) -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
     Step 'start sshd'
-    Set-Service sshd -StartupType Automatic
+    Set-Service sshd -StartupType Manual
     Start-Service sshd
     if ((Get-Service sshd).Status -ne 'Running') { throw 'SSH did not start' }
     Add-Content -Path $log -Encoding ascii -Value 'YG_SSH_READY'
