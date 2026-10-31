@@ -1,6 +1,6 @@
 # Azure agent test boxes
 
-Ephemeral Windows Server 2022 or Ubuntu 24.04 machines for agent network/game tests.
+Ephemeral Windows Server 2025 (default), Windows Server 2022 or Ubuntu 24.04 machines for agent network/game tests.
 Security has placed the dedicated `keys/agent-ssh.pub` test-boxes public key
 and restricted the `test-boxes` GitHub environment to `main`. Keep both prerequisites
 in place; the key must be one OpenSSH RSA or Ed25519 public key. No private key belongs
@@ -21,10 +21,14 @@ that the supplied address belongs to you. Do not use a shared or broad CIDR.
 ```sh
 gh workflow run box-up.yml -R yougame-co/build --ref main \
   -f label=link-test -f allow_cidr=<their-IP>/32
-# Optional: -f os=ubuntu-24.04 -f size=Standard_D2s_v6 -f region=eastus -f hours=2
+# Optional: -f os=windows-2022|ubuntu-24.04 -f size=Standard_D2s_v6 -f region=eastus -f hours=2
 gh run list -R yougame-co/build --workflow box-up.yml
 gh run view <run-id> -R yougame-co/build --log
 ```
+
+The log shows each step with its elapsed seconds (`[+42s] vm create`), so a slow step is visible. Each Azure call has
+its own client limit (vm create 20 min, the Windows SSH setup 15 min, anything else 5 min) and the job 50 min, so a
+stuck call fails with its step named and the box is cleaned up inside the job.
 
 Read the four result lines in the log (or the web job summary) for `name`, `public_ip`, `os`, `expires`. These same four
 fields are job outputs. The generated Windows password is discarded; use the
@@ -41,7 +45,8 @@ The command accepts a new host key on first connection and rejects changed keys.
 Verify the first fingerprint through a trusted Azure management session if needed.
 Never use `-A` (agent forwarding), never copy the dedicated key file, and never
 upload an SSH private key to a VM. A box that must reach another box gets its own
-throwaway key; destroy that key with the box. Windows SSH accepts only the repository public
+throwaway key; destroy that key with the box. Windows Server 2025 ships OpenSSH Server installed, so the guest script only enables it; on 2022 it downloads the
+Feature on Demand first, which can take most of the job (10-31). Windows SSH accepts only the repository public
 key via `administrators_authorized_keys`, with SYSTEM/Administrators ACLs and
 public key authentication only. Ubuntu uses Azure's SSH-only provisioning.
 TCP 22 and UDP 51600-51699 are the only allowed NSG inbound traffic, exclusively
@@ -102,7 +107,8 @@ The returned USD pay-as-you-go compute rates, per hour, were:
 | Ubuntu 24.04 | Standard_B2s | $0.0416 | $0.0832 |
 | Windows Server 2022 | Standard_B2s | $0.0496 | $0.0992 |
 
-Rates exclude the Standard HDD OS disk, Standard public IPv4, egress and taxes;
+Rates exclude the OS disk (Premium SSD since 10-31: Windows' first boot on Standard HDD was the slowest step;
+a 128 GiB P10 is about $0.03/hour), Standard public IPv4, egress and taxes;
 these can keep accruing until resources are deleted. Other regions/sizes cost
 more or less. The resource group has a $200/month budget with alerts. Check
 [Azure pricing](https://azure.microsoft.com/en-us/pricing/calculator/) before

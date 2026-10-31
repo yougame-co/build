@@ -4,9 +4,15 @@ $capability = Get-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0'
 if ($capability.State -ne 'Installed') {
     Add-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0' | Out-Null
 }
-# Generate host keys without starting the service with default authentication.
+# Generate host keys without starting the service with default authentication. On a fresh image sshd has
+# never run, so its ProgramData folder may not exist yet; private host keys get SYSTEM/Administrators-only ACLs.
+New-Item -ItemType Directory -Force -Path 'C:\ProgramData\ssh' | Out-Null
 & "$env:WINDIR\System32\OpenSSH\ssh-keygen.exe" -A
 if ($LASTEXITCODE -ne 0) { throw 'SSH host key generation failed' }
+foreach ($hostKey in Get-ChildItem 'C:\ProgramData\ssh\ssh_host_*_key') {
+    & icacls.exe $hostKey.FullName /inheritance:r /grant:r '*S-1-5-32-544:F' '*S-1-5-18:F' | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'SSH host key ACL configuration failed' }
+}
 $keyFile = 'C:\ProgramData\ssh\administrators_authorized_keys'
 Set-Content -Path $keyFile -Value '__PUBLIC_KEY__' -Encoding ascii
 & icacls.exe $keyFile /inheritance:r /grant:r '*S-1-5-32-544:F' '*S-1-5-18:F' | Out-Null
