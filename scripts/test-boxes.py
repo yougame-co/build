@@ -36,8 +36,11 @@ def az(*args):
     result = subprocess.run(['az', *args, '--only-show-errors', '--output', 'json'],
                             capture_output=True, text=True, check=False)
     if result.returncode:
-        # Azure errors can repeat passwords, request bodies or network rules.
-        raise RuntimeError('Azure operation failed: ' + ' '.join(args[:2]))
+        # Azure errors can repeat passwords, request bodies or network rules: keep only the error CODE
+        # (letters only, e.g. AuthorizationFailed), which is safe for a public log.
+        code = re.search(r'\(([A-Za-z]{3,64})\)|"code":\s*"([A-Za-z]{3,64})"|Code: ([A-Za-z]{3,64})', result.stderr or '')
+        code = next((g for g in code.groups() if g), None) if code else None
+        raise RuntimeError('Azure operation failed: ' + ' '.join(args[:2]) + (' [' + code + ']' if code else ''))
     return json.loads(result.stdout) if result.stdout.strip() else None
 
 
