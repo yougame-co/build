@@ -6,12 +6,6 @@ on:
         description: Manifest path in this repository (manifests/<name>.json)
         required: true
         type: string
-  workflow_call:
-    inputs:
-      manifest:
-        description: Manifest path in this repository (manifests/<name>.json)
-        required: true
-        type: string
 
 permissions: {}
 
@@ -22,7 +16,6 @@ jobs:
     permissions:
       contents: read
     outputs:
-      manifest: ${{ steps.manifest.outputs.manifest }}
       manifest_digest: ${{ steps.manifest.outputs.manifest_digest }}
     steps:
       - name: Checkout workflow repository
@@ -93,6 +86,14 @@ jobs:
           repository: yougame-co/build
           ref: ${{ github.workflow_sha }}
           persist-credentials: false
+      - name: Validate manifest from attest checkout
+        id: manifest
+        env:
+          MANIFEST_PATH: ${{ inputs.manifest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I scripts/crowd_manifest.py "$MANIFEST_PATH"
       - name: Download encrypted zip
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -100,8 +101,9 @@ jobs:
           path: ${{ runner.temp }}/crowd-handoff
       - name: Hash ciphertext and write validated manifest
         env:
-          VALIDATED_MANIFEST: ${{ needs.build.outputs.manifest }}
-          MANIFEST_DIGEST: ${{ needs.build.outputs.manifest_digest }}
+          VALIDATED_MANIFEST: ${{ steps.manifest.outputs.manifest }}
+          MANIFEST_DIGEST: ${{ steps.manifest.outputs.manifest_digest }}
+          BUILD_MANIFEST_DIGEST: ${{ needs.build.outputs.manifest_digest }}
         shell: bash
         run: |
           set -euo pipefail
@@ -113,14 +115,17 @@ jobs:
           from pathlib import Path
           validate = runpy.run_path('scripts/crowd_manifest.py')['canonical_manifest']
           canonical = validate(os.environ['VALIDATED_MANIFEST'])
-          if hashlib.sha256(canonical).hexdigest() != os.environ['MANIFEST_DIGEST']:
+          digest = hashlib.sha256(canonical).hexdigest()
+          if digest != os.environ['MANIFEST_DIGEST'] or digest != os.environ['BUILD_MANIFEST_DIGEST']:
               raise SystemExit('manifest digest mismatch')
           (Path(os.environ['RUNNER_TEMP']) / 'crowd-release/manifest.json').write_bytes(canonical)
           PY
-      - name: Attest the ciphertext
+      - name: Attest ciphertext and manifest together
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: ${{ runner.temp }}/crowd-release/build.zip.age
+          subject-path: |
+            ${{ runner.temp }}/crowd-release/build.zip.age
+            ${{ runner.temp }}/crowd-release/manifest.json
       - name: Upload encrypted release
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
