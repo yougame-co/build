@@ -49,6 +49,17 @@ class LifecycleTests(unittest.TestCase):
             boxes.reap(NOW)
         self.assertEqual(delete.call_args.args[0], [expired, ancient, missing, orphan_disk])
 
+    def test_reaper_reads_null_system_data_and_missing_created_time(self):
+        # Some resources (an auto-shutdown schedule) come back with createdTime and systemData null.
+        sched = resource('shutdown-computevm-x', 'microsoft.devtestlab/schedules', box='melty-lab-abc123')
+        sched.update({'createdTime': None, 'systemData': None})
+        sched['tags']['expires'] = '2099-01-01T00:00:00Z'
+        sched['tags']['created'] = '2026-10-31T19:00:00Z'
+        with patch.object(boxes, 'inventory', return_value=[sched]), patch.object(boxes, 'az') as az, \
+                contextlib.redirect_stdout(io.StringIO()):
+            boxes.reap(now=boxes.dt.datetime(2026, 10, 31, 20, 0, tzinfo=boxes.UTC))
+        az.assert_not_called()
+
     def test_down_refuses_unowned_or_absent_vm(self):
         for items in [[], [resource('ygbox-test-1', owner='human')]]:
             with patch.object(boxes, 'inventory', return_value=items), patch.object(boxes, 'delete_resources') as delete:
