@@ -61,8 +61,35 @@ Subsystem sftp sftp-server.exe
     if (-not (Get-NetFirewallRule -Name 'YouGame-Link' -ErrorAction SilentlyContinue)) {
         New-NetFirewallRule -Name 'YouGame-Link' -DisplayName 'YouGame Link' -Direction Inbound -Protocol UDP -LocalPort 51600-51699 -Action Allow | Out-Null
     }
+    # Clones of a captured image would share these host keys. A startup task regenerates them whenever the box boots
+    # on a different VM (SMBIOS UUID), then starts sshd; sshd itself stays Manual so it never serves the old key, and
+    # a failed regeneration leaves sshd without host keys, so it fails closed.
+    Step 'host key task'
+    @'
+$ErrorActionPreference = 'Stop'
+$marker = 'C:\yg\host-key-vm'
+$vm = (Get-CimInstance Win32_ComputerSystemProduct).UUID
+try {
+    if (-not (Test-Path $marker) -or (Get-Content $marker -Raw).Trim() -ne $vm) {
+        Stop-Service sshd -ErrorAction SilentlyContinue
+        Remove-Item 'C:\ProgramData\ssh\ssh_host_*' -Force
+        & "$env:WINDIR\System32\OpenSSH\ssh-keygen.exe" -A | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'host key generation failed' }
+        foreach ($hostKey in Get-ChildItem 'C:\ProgramData\ssh\ssh_host_*_key') {
+            & icacls.exe $hostKey.FullName /inheritance:r /grant:r '*S-1-5-32-544:F' '*S-1-5-18:F' | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'host key ACL failed' }
+        }
+        Set-Content -Path $marker -Value $vm -Encoding ascii
+    }
+} finally {
+    Start-Service sshd
+}
+'@ | Set-Content -Path 'C:\yg\ssh-hostkeys.ps1' -Encoding ascii
+    Set-Content -Path 'C:\yg\host-key-vm' -Value (Get-CimInstance Win32_ComputerSystemProduct).UUID -Encoding ascii
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -ExecutionPolicy Bypass -File C:\yg\ssh-hostkeys.ps1'
+    Register-ScheduledTask -TaskName 'YouGame-SSH-HostKeys' -Action $action -Trigger (New-ScheduledTaskTrigger -AtStartup) -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
     Step 'start sshd'
-    Set-Service sshd -StartupType Automatic
+    Set-Service sshd -StartupType Manual
     Start-Service sshd
     if ((Get-Service sshd).Status -ne 'Running') { throw 'SSH did not start' }
     Add-Content -Path $log -Encoding ascii -Value 'YG_SSH_READY'

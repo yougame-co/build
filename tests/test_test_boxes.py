@@ -419,6 +419,16 @@ class LifecycleTests(unittest.TestCase):
         with patch.object(boxes, 'az', side_effect=flaky), patch.object(boxes.time, 'sleep'):
             boxes.wait_guest_agent([], 'box')
 
+    def test_clones_regenerate_ssh_host_keys_per_vm(self):
+        script = (Path(__file__).resolve().parents[1] / 'scripts/test-boxes-windows.ps1').read_text()
+        task = script.split("@'\n$ErrorActionPreference")[1].split("'@ | Set-Content -Path 'C:\\yg\\ssh-hostkeys.ps1'")[0]
+        self.assertIn('Win32_ComputerSystemProduct', task)
+        self.assertIn("Remove-Item 'C:\\ProgramData\\ssh\\ssh_host_*' -Force", task)
+        self.assertIn('finally {\n    Start-Service sshd', task)
+        self.assertIn('-StartupType Manual', script)
+        self.assertNotIn('-StartupType Automatic', script)
+        self.assertIn('New-ScheduledTaskTrigger -AtStartup', script)
+
     def test_default_os_is_windows_2025_and_unknown_os_refused(self):
         workflow = (Path(__file__).parents[1] / '.github/workflows/box-up.yml').read_text()
         self.assertIn('default: windows-2025', workflow)
