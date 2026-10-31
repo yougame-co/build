@@ -12,6 +12,11 @@ on:
         type: choice
         options: [windows-2025, windows-2022, ubuntu-24.04]
         default: windows-2025
+      image:
+        description: 'Prepared image: 1-32 lowercase letters, digits, hyphens; alphanumeric ends (overrides os)'
+        type: string
+        required: false
+        default: ''
       size:
         description: Azure VM size (GPU requires available quota)
         type: string

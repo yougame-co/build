@@ -16,6 +16,12 @@ spec.loader.exec_module(boxes)
 NOW = dt.datetime(2026, 10, 31, tzinfo=dt.timezone.utc)
 
 
+class CaptureTime(dt.datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return NOW.replace(hour=12, minute=34, second=56)
+
+
 def resource(name, kind=boxes.VM_TYPE, **tags):
     return {'name': name, 'id': '/mock/' + name, 'type': kind,
             'createdTime': (NOW - dt.timedelta(hours=1)).isoformat(),
@@ -23,6 +29,232 @@ def resource(name, kind=boxes.VM_TYPE, **tags):
 
 
 class LifecycleTests(unittest.TestCase):
+    @contextlib.contextmanager
+    def capture_case(self, missing=(), scan='YG_NO_DISC', fail_version=False, items=None):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            vm = resource('ygbox-test-123', box='ygbox-test-123')
+            vm['location'] = 'eastus'
+            calls = []
+            version = []
+
+            def fake_az(*args):
+                calls.append(args)
+                if args[:2] == ('vm', 'get-instance-view'):
+                    return {'instanceView': {'vmAgent': {'statuses': [{'displayStatus': 'Ready'}]}}}
+                if args[:3] == ('vm', 'run-command', 'invoke'):
+                    return {'value': [{'message': scan}]}
+                if args[:2] == ('sig', 'show'):
+                    if 'gallery' in missing:
+                        raise RuntimeError('missing gallery')
+                    return {'id': '/mock/gallery'}
+                if args[:2] == ('sig', 'create'):
+                    return {'id': '/mock/gallery'}
+                if args[:3] == ('sig', 'image-definition', 'show'):
+                    if 'definition' in missing:
+                        raise RuntimeError('missing definition')
+                    return {'id': '/mock/definition'}
+                if args[:3] == ('sig', 'image-definition', 'create'):
+                    return {'id': '/mock/definition'}
+                if args[:3] == ('sig', 'image-version', 'create'):
+                    if fail_version:
+                        raise RuntimeError('capture failed')
+                    version.append(args[args.index('--gallery-image-version') + 1])
+                    return {}
+                if args[:3] == ('sig', 'image-version', 'list'):
+                    return [{'name': n} for n in ['1.20260101.10', version[0],
+                                                  '1.20260101.9', '1.20260101.11']]
+                return {}
+
+            env = {'GITHUB_RUN_ID': '123', 'AZURE_RESOURCE_GROUP': 'mock',
+                   'GITHUB_OUTPUT': str(root/'output'), 'GITHUB_STEP_SUMMARY': str(root/'summary')}
+            with patch.dict(os.environ, env), patch.object(boxes, 'login') as login, patch.object(boxes, 'az', side_effect=fake_az), patch.object(boxes, 'inventory', return_value=[vm] if items is None else items), patch.object(boxes.dt, 'datetime', CaptureTime), patch.object(boxes.time, 'sleep'), contextlib.redirect_stdout(io.StringIO()) as output:
+                yield root, calls, vm, version, login, output
+
+    def test_capture_validates_before_login(self):
+        valid = {'name': 'ygbox-test-123', 'image': 'prepared', 'no_disc': 'yes'}
+        cases = [({'no_disc': 'no'}, 'Refusing capture: confirm no game disc, ROM or signed-in account is on the box'),
+                 ({'no_disc': ''}, 'Refusing capture: confirm no game disc, ROM or signed-in account is on the box'),
+                 ({'name': 'invalid'}, 'Invalid box name')]
+        cases += [({'image': image}, 'Invalid image name')
+                  for image in ['', '-bad', 'bad-', 'Upper', 'x' * 33, 'bad\nname']]
+        with patch.object(boxes, 'login') as login, patch.object(boxes, 'az') as az:
+            for changes, error in cases:
+                with self.subTest(changes=changes), self.assertRaisesRegex(boxes.ValidationError, error):
+                    boxes.capture({**valid, **changes})
+            with self.assertRaisesRegex(boxes.ValidationError, 'confirm no game disc'):
+                boxes.capture({'name': valid['name'], 'image': valid['image']})
+            login.assert_not_called()
+            az.assert_not_called()
+
+    def test_capture_refuses_missing_or_unowned_vm(self):
+        for items in [[], [resource('ygbox-test-123', owner='human')],
+                      [resource('ygbox-test-123', 'microsoft.compute/galleries/images', owner='agent-image')]]:
+            with self.subTest(items=items), self.capture_case(items=items) as case:
+                with self.assertRaisesRegex(boxes.ValidationError, 'VM must exist and have owner=agent'):
+                    boxes.capture({'name': 'ygbox-test-123', 'image': 'prepared', 'no_disc': 'yes'})
+                self.assertEqual(case[1], [])
+
+    def test_capture_disc_guard_fails_before_deallocation(self):
+        for scan in ['YG_DISC_FOUND 2', '', 'guest script failed']:
+            with self.subTest(scan=scan), self.capture_case(scan=scan) as case:
+                with self.assertRaisesRegex(boxes.ValidationError, 'guest disc scan failed'):
+                    boxes.capture({'name': 'ygbox-test-123', 'image': 'prepared', 'no_disc': 'yes'})
+                self.assertEqual([c[:2] for c in case[1]], [('vm', 'get-instance-view'), ('vm', 'run-command')])
+                self.assertFalse((case[0]/'output').exists())
+
+    def test_capture_creates_specialized_image_and_keeps_newest_two(self):
+        for missing in [(), ('gallery',), ('definition',), ('gallery', 'definition')]:
+            with self.subTest(missing=missing), self.capture_case(missing=missing) as case:
+                root, calls, vm, version, login, output = case
+                boxes.capture({'name': vm['name'], 'image': 'prepared', 'no_disc': 'yes'})
+                login.assert_called_once()
+                self.assertEqual(calls[0][:2], ('vm', 'get-instance-view'))
+                self.assertEqual(calls[1][:3], ('vm', 'run-command', 'invoke'))
+                scan = calls[1][-1]
+                for text in [r'C:\src', r'C:\Users', r'C:\ProgramData\YouGame*',
+                             '-ErrorAction SilentlyContinue', '-Force -Recurse -File',
+                             '1GB', 'YG_NO_DISC', 'YG_DISC_FOUND',
+                             '.iso', '.gcm', '.rvz', '.ciso', '.wbfs', '.wia', '.gcz', '.nkit']:
+                    self.assertIn(text, scan)
+                self.assertNotIn('FullName', scan)
+                self.assertEqual(calls[2][:2], ('vm', 'deallocate'))
+                self.assertEqual(calls[3][:2], ('sig', 'show'))
+                self.assertEqual(sum(c[:2] == ('sig', 'create') for c in calls), int('gallery' in missing))
+                definitions = [c for c in calls if c[:3] == ('sig', 'image-definition', 'create')]
+                self.assertEqual(len(definitions), int('definition' in missing))
+                if definitions:
+                    for flag, value in [('--os-type', 'Windows'), ('--os-state', 'Specialized'),
+                                        ('--hyper-v-generation', 'V2'), ('--features', 'SecurityType=Standard'),
+                                        ('--publisher', 'yougame'), ('--offer', 'testbox'), ('--sku', 'prepared')]:
+                        self.assertEqual(definitions[0][definitions[0].index(flag) + 1], value)
+                create = next(c for c in calls if c[:3] == ('sig', 'image-version', 'create'))
+                for flag, value in [('--virtual-machine', vm['id']), ('--target-regions', vm['location']),
+                                    ('--replica-count', '1'), ('--storage-account-type', 'Standard_LRS')]:
+                    self.assertEqual(create[create.index(flag) + 1], value)
+                self.assertRegex(version[0], r'^1\.[0-9]{8}\.[0-9]{6}$')
+                self.assertEqual(version[0], '1.20261031.123456')
+                tagged = [c for c in calls if '--tags' in c]
+                self.assertGreaterEqual(len(tagged), 3)
+                for call in tagged:
+                    for tag in ['owner=agent-image', 'purpose=image', 'source=' + vm['name'], 'run=123']:
+                        self.assertIn(tag, call)
+                    self.assertTrue(any(v.startswith('created=') for v in call))
+                    self.assertNotIn('owner=agent', call)
+                deleted = [c for c in calls if c[:3] == ('sig', 'image-version', 'delete')]
+                self.assertEqual([c[c.index('--gallery-image-version') + 1] for c in deleted],
+                                 ['1.20260101.9', '1.20260101.10'])
+                self.assertTrue(all(calls.index(c) > calls.index(create) for c in deleted))
+                self.assertFalse(any(c[:2] == ('resource', 'delete') for c in calls))
+                self.assertEqual((root/'output').read_text(), 'image=prepared\nversion=' + version[0] + '\n')
+                for text in [vm['name'], 'image: prepared', 'version: ' + version[0], 'box-down']:
+                    self.assertIn(text, output.getvalue())
+                    self.assertIn(text, (root/'summary').read_text())
+                self.assertNotIn(vm['id'], output.getvalue())
+
+    def test_capture_failure_after_deallocation_keeps_source_and_versions(self):
+        with self.capture_case(fail_version=True) as case:
+            with self.assertRaisesRegex(RuntimeError, 'capture failed'):
+                boxes.capture({'name': 'ygbox-test-123', 'image': 'prepared', 'no_disc': 'yes'})
+            calls = case[1]
+            self.assertTrue(any(c[:2] == ('vm', 'deallocate') for c in calls))
+            self.assertFalse(any('delete' in c or 'start' in c for c in calls))
+            self.assertFalse((case[0]/'output').exists())
+
+    @contextlib.contextmanager
+    def image_up_case(self, versions):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            vm = resource('ygbox-test-123', box='ygbox-test-123')
+            disk = resource('ygbox-test-123-os', boxes.DISK_TYPE, box='ygbox-test-123')
+            calls = []
+
+            def fake_az(*args):
+                calls.append(args)
+                if args[:3] == ('sig', 'image-version', 'list'):
+                    return versions
+                if args[:3] == ('network', 'public-ip', 'show'):
+                    return {'ipAddress': 'synthetic-address'}
+                return {}
+
+            old = os.getcwd()
+            try:
+                os.chdir(root)
+                env = {'GITHUB_RUN_ID': '123', 'AZURE_RESOURCE_GROUP': 'mock',
+                       'GITHUB_OUTPUT': str(root/'output'), 'GITHUB_STEP_SUMMARY': str(root/'summary')}
+                with patch.dict(os.environ, env), patch.object(boxes, 'login') as login, patch.object(boxes, 'az', side_effect=fake_az), patch.object(boxes, 'inventory', side_effect=[[], [vm, disk], [vm, disk]]), patch.object(boxes.time, 'sleep'), patch.object(boxes, 'wait_guest_agent') as wait, patch.object(boxes.secrets, 'token_urlsafe') as password, contextlib.redirect_stdout(io.StringIO()) as output:
+                    inputs = {'label': 'test', 'image': 'prepared', 'os': 'ignored',
+                              'allow_cidr': str(boxes.ipaddress.IPv4Address(0x08080808)) + '/32'}
+                    yield root, calls, inputs, wait, password, login, output
+            finally:
+                os.chdir(old)
+
+    def test_up_image_uses_newest_specialized_version_without_guest_setup(self):
+        versions = [{'name': n, 'id': '/mock/version/' + n}
+                    for n in ['1.20260101.9', '1.20260101.11', '1.20260101.10']]
+        with self.image_up_case(versions) as case:
+            root, calls, inputs, wait, password, login, output = case
+            boxes.up(inputs)
+            login.assert_called_once()
+            create = next(c for c in calls if c[:2] == ('vm', 'create'))
+            self.assertEqual(create[create.index('--image') + 1], versions[1]['id'])
+            self.assertIn('--specialized', create)
+            for flag in ['--admin-username', '--admin-password', '--computer-name',
+                         '--authentication-type', '--ssh-key-values']:
+                self.assertNotIn(flag, create)
+            for flag, value in [('--security-type', 'Standard'), ('--storage-sku', 'Premium_LRS'),
+                                ('--nics', 'ygbox-test-123-nic'), ('--os-disk-name', 'ygbox-test-123-os'),
+                                ('--os-disk-delete-option', 'Detach'), ('--nic-delete-option', 'Detach')]:
+                self.assertEqual(create[create.index(flag) + 1], value)
+            self.assertIn('owner=agent', create)
+            self.assertFalse(any(c[:2] in [('vm', 'run-command'), ('vm', 'get-instance-view')] for c in calls))
+            wait.assert_not_called()
+            password.assert_not_called()
+            self.assertIn('os=image:prepared\n', (root/'output').read_text())
+            self.assertIn('image prepared 1.20260101.11', output.getvalue())
+            self.assertEqual(len([c for c in calls if c[:4] == ('network', 'nsg', 'rule', 'create')]), 3)
+
+    def test_up_image_without_versions_fails_before_creating_resources(self):
+        with self.image_up_case([]) as case:
+            with self.assertRaisesRegex(boxes.ValidationError, '^No image version for prepared$'):
+                boxes.up(case[2])
+            self.assertEqual([c[:3] for c in case[1]], [('sig', 'image-definition', 'show'),
+                                                                     ('sig', 'image-version', 'list')])
+            self.assertFalse((case[0]/'output').exists())
+
+    def test_up_rejects_invalid_image_before_login(self):
+        with patch.object(boxes, 'login') as login:
+            with self.assertRaisesRegex(boxes.ValidationError, 'Invalid image name'):
+                boxes.up({'image': 'Invalid'})
+            login.assert_not_called()
+
+    def test_reaper_ignores_gallery_definition_and_version_image_owners(self):
+        images = [resource('ygbox-test-123', kind, owner='agent-image', box='ygbox-test-123', expires='invalid')
+                  for kind in ['microsoft.compute/galleries', 'microsoft.compute/galleries/images',
+                               'microsoft.compute/galleries/images/versions']]
+        for image in images:
+            image['createdTime'] = (NOW - dt.timedelta(days=30)).isoformat()
+        with patch.object(boxes, 'inventory', return_value=images), patch.object(boxes, 'delete_resources') as delete:
+            boxes.reap(NOW)
+            delete.assert_called_once_with([])
+            with self.assertRaises(boxes.ValidationError):
+                boxes.down('ygbox-test-123')
+            delete.assert_called_once_with([])
+
+    def test_capture_workflow_reuses_mask_checkout_and_environment(self):
+        workflows = Path(__file__).parents[1] / '.github/workflows'
+        up = (workflows / 'box-up.yml').read_text()
+        capture = (workflows / 'box-image.yml').read_text()
+        self.assertEqual(up.split('    env:\n')[1].split('    outputs:\n')[0],
+                         capture.split('    env:\n')[1].split('    outputs:\n')[0])
+        self.assertEqual(up.split('    steps:\n')[1].replace('test-boxes.py up', 'test-boxes.py capture'),
+                         capture.split('    steps:\n')[1])
+        for text in ['timeout-minutes: 75', 'environment: test-boxes', 'contents: read',
+                     'id-token: write', "options: ['no', 'yes']", "default: 'no'"]:
+            self.assertIn(text, capture)
+        self.assertEqual(capture.split('on:\n')[1].split('\nconcurrency:')[0].splitlines()[0],
+                         '  workflow_dispatch:')
+
     def test_missing_key_fails_before_login(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(boxes, 'login') as login:
             old = os.getcwd()
@@ -209,6 +441,18 @@ class LifecycleTests(unittest.TestCase):
                 boxes.az('vm', 'create', '--admin-password', 'synthetic-placeholder')
         self.assertEqual(run.call_count, 1)
         self.assertEqual(run.call_args.kwargs['timeout'], boxes.TIMEOUTS[('vm', 'create')])
+
+    def test_gallery_timeouts_apply_to_the_correct_operations(self):
+        for operation, limit in [(('sig', 'create'), 900),
+                                 (('sig', 'image-definition', 'create'), 900),
+                                 (('sig', 'image-definition', 'show'), 900),
+                                 (('sig', 'image-version', 'create'), 3600),
+                                 (('sig', 'image-version', 'list'), 300)]:
+            with self.subTest(operation=operation), patch.object(boxes.subprocess, 'run') as run:
+                run.return_value.returncode = 0
+                run.return_value.stdout = '{}'
+                boxes.az(*operation)
+                self.assertEqual(run.call_args.kwargs['timeout'], limit)
 
     def test_mask_escapes_workflow_command_characters(self):
         output = io.StringIO()

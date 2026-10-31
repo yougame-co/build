@@ -18,6 +18,21 @@ UTC = dt.timezone.utc
 ADMIN = 'ygagent'
 VM_TYPE = 'microsoft.compute/virtualmachines'
 DISK_TYPE = 'microsoft.compute/disks'
+GALLERY = 'yg_test_boxes'
+IMAGE_NAME = r'[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?'
+DISC_SCAN = r"""
+$extensions = @('.iso', '.gcm', '.rvz', '.ciso', '.wbfs', '.wia', '.gcz', '.nkit')
+$count = 0
+foreach ($root in @('C:\src', 'C:\Users', 'C:\ProgramData\YouGame*')) {
+    if (Test-Path -Path $root -ErrorAction SilentlyContinue) {
+        Get-ChildItem -Path $root -ErrorAction SilentlyContinue -Force -Recurse -File |
+            Where-Object { $extensions -contains $_.Extension -or $_.Length -gt 1GB } |
+            ForEach-Object { $count++ }
+    }
+}
+if ($count -eq 0) { Write-Output 'YG_NO_DISC' }
+else { Write-Output ('YG_DISC_FOUND ' + $count) }
+"""
 
 
 # Windows Server 2025 ships OpenSSH Server installed (only enabled by the guest script); 2022 downloads it as a
@@ -26,7 +41,9 @@ IMAGES = {'windows-2025': 'MicrosoftWindowsServer:WindowsServer:2025-datacenter-
           'windows-2022': 'MicrosoftWindowsServer:WindowsServer:2022-datacenter-g2:latest',
           'ubuntu-24.04': 'Canonical:ubuntu-24_04-lts:server:latest'}
 # Per-call client timeouts (seconds): a stuck call fails with its step named and cleanup still runs inside the job.
-TIMEOUTS = {('vm', 'create'): 900, ('vm', 'run-command'): 900}
+TIMEOUTS = {('vm', 'create'): 900, ('vm', 'run-command'): 900,
+            ('sig', 'create'): 900, ('sig', 'image-definition'): 900,
+            ('sig', 'image-version', 'create'): 3600}
 STARTED = time.monotonic()
 
 SIZES = {'Standard_D2s_v6', 'Standard_D4s_v6', 'Standard_D2as_v7', 'Standard_D4as_v7',
@@ -52,7 +69,7 @@ def az(*args, timeout=None):
     # az 2.91 can crash with an import deadlock (_DeadlockError on requests.structures) when its telemetry thread
     # imports at the same time: telemetry off, and one retry on exactly that crash (box run 41177256736).
     env = {**os.environ, 'AZURE_CORE_COLLECT_TELEMETRY': 'false'}
-    limit = timeout or TIMEOUTS.get(tuple(args[:2]), 300)
+    limit = timeout or TIMEOUTS.get(tuple(args[:3]), TIMEOUTS.get(tuple(args[:2]), 300))
     for attempt in range(3):
         try:
             result = subprocess.run(['az', *args, '--only-show-errors', '--output', 'json'],
@@ -293,9 +310,86 @@ def reap(now=None):
     delete_resources(selected + disk_companions(resources, boxes))
 
 
+def image_versions(rg, image):
+    versions = az('sig', 'image-version', 'list', *rg, '--gallery-name', GALLERY,
+                  '--gallery-image-definition', image) or []
+    return sorted(versions, key=lambda v: tuple(int(n) for n in v['name'].split('.')))
+
+
+def capture(inputs):
+    name, image = inputs['name'], inputs['image']
+    if not re.fullmatch(r'ygbox-[a-z0-9-]+-[0-9]+', name):
+        raise ValidationError('Invalid box name')
+    if not re.fullmatch(IMAGE_NAME, image):
+        raise ValidationError('Invalid image name')
+    if inputs.get('no_disc') != 'yes':
+        raise ValidationError('Refusing capture: confirm no game disc, ROM or signed-in account is on the box')
+    step('login')
+    login()
+    vm = next((r for r in inventory() if r['name'] == name and
+               r['type'].lower() == VM_TYPE and owned(r)), None)
+    if vm is None:
+        raise ValidationError('Refusing capture: VM must exist and have owner=agent')
+    rg = ['--resource-group', os.environ['AZURE_RESOURCE_GROUP']]
+    step('guest agent')
+    wait_guest_agent(rg, name)
+    step('disc scan')
+    result = az('vm', 'run-command', 'invoke', *rg, '--name', name,
+                '--command-id', 'RunPowerShellScript', '--scripts', DISC_SCAN)
+    if not any('YG_NO_DISC' in v.get('message', '') for v in (result or {}).get('value', [])):
+        raise ValidationError('Refusing capture: guest disc scan failed')
+    step('deallocate')
+    az('vm', 'deallocate', *rg, '--name', name)
+    now = dt.datetime.now(UTC)
+    tags = ['owner=agent-image', 'purpose=image', 'source=' + name,
+            'run=' + os.environ['GITHUB_RUN_ID'], 'created=' + now.strftime('%Y-%m-%dT%H:%M:%SZ')]
+    gallery_args = [*rg, '--gallery-name', GALLERY]
+    step('gallery')
+    try:
+        gallery = az('sig', 'show', *gallery_args)
+    except RuntimeError:
+        gallery = az('sig', 'create', *gallery_args, '--location', vm['location'], '--tags', *tags)
+    az('resource', 'tag', '--ids', gallery['id'], '--tags', *tags)
+    definition_args = [*gallery_args, '--gallery-image-definition', image]
+    step('image definition')
+    try:
+        definition = az('sig', 'image-definition', 'show', *definition_args)
+    except RuntimeError:
+        definition = az('sig', 'image-definition', 'create', *definition_args,
+                        '--location', vm['location'], '--os-type', 'Windows',
+                        '--os-state', 'Specialized', '--hyper-v-generation', 'V2',
+                        '--features', 'SecurityType=Standard', '--publisher', 'yougame',
+                        '--offer', 'testbox', '--sku', image, '--tags', *tags)
+    az('resource', 'tag', '--ids', definition['id'], '--tags', *tags)
+    version = now.strftime('1.%Y%m%d.%H%M%S')
+    step('image version')
+    az('sig', 'image-version', 'create', *definition_args, '--gallery-image-version', version,
+       '--location', vm['location'], '--virtual-machine', vm['id'],
+       '--target-regions', vm['location'], '--replica-count', '1',
+       '--storage-account-type', 'Standard_LRS', '--tags', *tags)
+    step('image retention')
+    for old in image_versions(rg, image)[:-2]:
+        az('sig', 'image-version', 'delete', *definition_args,
+           '--gallery-image-version', old['name'])
+    output = {'name': name, 'image': image, 'version': version}
+    for k, v in output.items():
+        print(k + ': ' + v)
+    print('Source box deallocated; run box-down with name: ' + name)
+    with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+        for k in ('image', 'version'):
+            f.write(k + '=' + output[k] + '\n')
+    with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+        for k, v in output.items():
+            f.write(k + ': ' + v + '\n\n')
+        f.write('Source box deallocated; run box-down with name: ' + name + '\n')
+
+
 def up(inputs):
+    image = inputs.get('image', '')
+    if image and not re.fullmatch(IMAGE_NAME, image):
+        raise ValidationError('Invalid image name')
     key_file = Path('keys/agent-ssh.pub')
-    if not key_file.is_file():
+    if not image and not key_file.is_file():
         raise ValidationError('keys/agent-ssh.pub missing (security places it)')
     label = inputs['label']
     if not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?', label):
@@ -307,8 +401,8 @@ def up(inputs):
     if network.version != 4 or network.prefixlen != 32 or not network.network_address.is_global:
         raise ValidationError('allow_cidr must be a public IPv4 address with /32')
     mask(str(network.network_address))
-    os_name = inputs.get('os', 'windows-2025')
-    if os_name not in IMAGES:
+    os_name = 'image:' + image if image else inputs.get('os', 'windows-2025')
+    if not image and os_name not in IMAGES:
         raise ValidationError('Invalid os')
     hours = inputs.get('hours', '2')
     if not re.fullmatch(r'(?:[1-9]|1[0-2])', str(hours)):
@@ -318,12 +412,13 @@ def up(inputs):
     if size not in SIZES or not re.fullmatch(r'[a-z0-9]+', region):
         raise ValidationError('Invalid size or region (sizes: ' + ', '.join(sorted(SIZES)) + ')')
     # Keep only key type/base64, never comments identifying its owner. Reject options.
-    key_parts = key_file.read_text().strip().split()
-    if len(key_file.read_text().strip().splitlines()) != 1 or len(key_parts) < 2:
-        raise ValidationError('Expected exactly one SSH public key')
-    if key_parts[0] not in ('ssh-ed25519', 'ssh-rsa') or not re.fullmatch(r'[A-Za-z0-9+/=]+', key_parts[1]):
-        raise ValidationError('Invalid SSH public key')
-    key = ' '.join(key_parts[:2])
+    if not image:
+        key_parts = key_file.read_text().strip().split()
+        if len(key_file.read_text().strip().splitlines()) != 1 or len(key_parts) < 2:
+            raise ValidationError('Expected exactly one SSH public key')
+        if key_parts[0] not in ('ssh-ed25519', 'ssh-rsa') or not re.fullmatch(r'[A-Za-z0-9+/=]+', key_parts[1]):
+            raise ValidationError('Invalid SSH public key')
+        key = ' '.join(key_parts[:2])
     step('login')
     login()
     name = 'ygbox-' + label + '-' + os.environ['GITHUB_RUN_ID']
@@ -337,6 +432,13 @@ def up(inputs):
     # A rerun must never reset/overwrite a live VM's password or SSH configuration.
     if any(r['name'] == name for r in inventory()):
         raise ValidationError('Box already exists; use box-down before retrying')
+    if image:
+        az('sig', 'image-definition', 'show', *rg, '--gallery-name', GALLERY,
+           '--gallery-image-definition', image)
+        versions = image_versions(rg, image)
+        if not versions:
+            raise ValidationError('No image version for ' + image)
+        version = versions[-1]
     windows = os_name.startswith('windows-')
     try:
         step('network')
@@ -360,18 +462,22 @@ def up(inputs):
            '--vnet-name', name + '-vnet', '--subnet', 'box',
            '--network-security-group', name + '-nsg', '--public-ip-address', name + '-ip')
         vm_args = ['vm', 'create', '--name', name, *common, '--size', size,
-                   '--nics', name + '-nic', '--admin-username', ADMIN,
-                   '--computer-name', 'ygbox' + os.environ['GITHUB_RUN_ID'][-10:],
+                   '--nics', name + '-nic',
                    '--os-disk-name', name + '-os', '--storage-sku', 'Premium_LRS',
                    '--security-type', 'Standard',
                    '--os-disk-delete-option', 'Detach', '--nic-delete-option', 'Detach']
-        vm_args += ['--image', IMAGES[os_name]]
-        if windows:
-            password = 'Yg9!' + secrets.token_urlsafe(32)
-            mask(password)
-            vm_args += ['--admin-password', password]
+        if image:
+            vm_args += ['--image', version['id'], '--specialized']
+            step('image ' + image + ' ' + version['name'])
         else:
-            vm_args += ['--authentication-type', 'ssh', '--ssh-key-values', str(key_file)]
+            vm_args += ['--image', IMAGES[os_name], '--admin-username', ADMIN,
+                        '--computer-name', 'ygbox' + os.environ['GITHUB_RUN_ID'][-10:]]
+            if windows:
+                password = 'Yg9!' + secrets.token_urlsafe(32)
+                mask(password)
+                vm_args += ['--admin-password', password]
+            else:
+                vm_args += ['--authentication-type', 'ssh', '--ssh-key-values', str(key_file)]
         step('vm create')
         az(*vm_args)
         disk = next(r for r in inventory() if r['name'] == name + '-os' and r['type'].lower() == DISK_TYPE)
@@ -408,6 +514,8 @@ def main():
         mask(inputs['allow_cidr'].split('/')[0])
     if sys.argv[1] == 'up':
         up(inputs)
+    elif sys.argv[1] == 'capture':
+        capture(inputs)
     elif sys.argv[1] == 'down':
         # Check syntax before obtaining a token.
         if not re.fullmatch(r'ygbox-[a-z0-9-]+-[0-9]+', inputs['name']):
