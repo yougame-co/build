@@ -126,7 +126,10 @@ class LabTests(unittest.TestCase):
                 patch.object(lab, 'login', lambda az: real_login(az, self.opener)), \
                 patch.object(lab.time, 'sleep'), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            lab.main([command], az=self.az, now=NOW)
+            try:
+                lab.main([command], az=self.az, now=NOW)
+            finally:
+                self.last_out = out.getvalue()
         written = out_file.read_text() if out_file.exists() else ''
         return out.getvalue(), err.getvalue(), written
 
@@ -168,10 +171,11 @@ class LabTests(unittest.TestCase):
         self.assertEqual(mode, 0o600)
         self.assertFalse(path.exists())
         self.assertGreaterEqual(len(secret), 24)
-        visible = out.replace('::add-mask::' + secret, '')
+        escaped = '::add-mask::' + secret.replace('%', '%25')
+        visible = out.replace(escaped, '')
         self.assertNotIn(secret, visible + err + written)
-        self.assertIn('::add-mask::' + secret, out)
-        self.assertLess(out.index('::add-mask::' + secret), out.index('vm create'))
+        self.assertIn(escaped + '\n', out)
+        self.assertLess(out.index(escaped), out.index('vm create'))
         for argv, _ in self.fake.calls:
             self.assertTrue(all(secret not in arg for arg in argv))
         create = next(c for c, _ in self.fake.calls if c[1:3] == ['vm', 'create'])
@@ -274,6 +278,37 @@ class LabTests(unittest.TestCase):
         self.assertEqual(self.fake.resources, [])
         self.assertEqual(written.splitlines()[-2:], [f'name={NAME}', 'deleted=7'])
 
+    def test_down_all_removes_only_melty_boxes(self):
+        self.up()
+        other = self.fake.add('Microsoft.Compute/virtualMachines', 'ygbox-x-1', {'owner': 'agent', 'box': 'ygbox-x-1'})
+        luis = self.fake.add('Microsoft.Compute/virtualMachines', 'melty-lab-123456', {'owner': 'luis', 'box': 'melty-lab-123456',
+                                                                                       'purpose': 'melty-lab'})
+        _, _, written = self.main('down', {'name': 'all'})
+        self.assertEqual(self.fake.resources, [other, luis])
+        self.assertIn(f'name={NAME}\ndeleted=7', written)
+
+    def test_optional_steps_do_not_fail_the_box(self):
+        class NoDevTestLab(FakeAz):
+            def __call__(self, argv, **kwargs):
+                if argv[1:3] in (['vm', 'auto-shutdown'], ['vm', 'boot-diagnostics']):
+                    self.calls.append((argv, kwargs))
+                    return subprocess.CompletedProcess(argv, 1, '', 'ERROR: (MissingSubscriptionRegistration) no')
+                return super().__call__(argv, **kwargs)
+        self.fake = NoDevTestLab()
+        self.az = lab.Az(self.fake)
+        out, _, written = self.up()
+        self.assertIn('note: auto-shutdown unavailable (MissingSubscriptionRegistration)', out)
+        self.assertIn('note: boot diagnostics off unavailable', out)
+        self.assertIn(f'name={NAME}', written)
+        self.assertFalse(any(c[1:3] == ['resource', 'tag'] and 'Microsoft.DevTestLab/schedules' in c for c, _ in self.fake.calls))
+
+    def test_failure_prints_original_error_then_cleans_up(self):
+        self.fake.identity = {'type': 'SystemAssigned'}
+        with self.assertRaises(lab.ValidationError):
+            self.up()
+        self.assertIn('failed: VM unexpectedly has an identity', self.last_out)
+        self.assertLess(self.last_out.index('name: ' + NAME), self.last_out.index('failed:'))
+
     def test_down_order_and_recovery(self):
         tags = {'owner': 'agent', 'box': NAME}
         for kind, suffix, owned in [('Microsoft.Network/virtualNetworks', '-vnet', True),
@@ -323,8 +358,9 @@ class LabTests(unittest.TestCase):
                 return super().__call__(argv, **kwargs)
         stuck = StuckFake()
         stuck.add('Microsoft.Compute/virtualMachines', NAME, {'owner': 'agent', 'box': NAME})
-        with self.assertRaises(lab.ValidationError):
+        with patch.object(lab.time, 'sleep') as sleep, self.assertRaises(lab.ValidationError):
             lab.down(lab.Az(stuck), NAME, RG)
+        self.assertEqual(sleep.call_count, 3)
 
     def test_error_masking_secret_and_guest_output(self):
         secret = 'A-secret-do-not-print-123!'
