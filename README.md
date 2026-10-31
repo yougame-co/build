@@ -26,9 +26,53 @@ workflows here must not upload build outputs.
 
 A notice against an entry takes that entry down within 24 hours.
 
+## Crowd builds
+
+`crowd-build.yml` accepts a repository manifest through `workflow_dispatch` only.
+Its build job has only `contents: read`: it validates the
+manifest, fetches the pinned public source, runs the recipe, and encrypts the zip
+with age to `keys/artifacts.age.pub` from this repository at the workflow commit.
+It uploads only `build.zip.age` for the attest job (one-day retention). A separate
+attest job runs no source or recipe code and never decrypts: it derives the manifest
+from its own checkout at the workflow commit, cross-checks its digest against the
+build job's digest, and attests both the ciphertext and manifest in one GitHub build
+provenance statement. Its final artifact contains only
+`build.zip.age`, `build.zip.age.sha256` and the validated `manifest.json`
+(seven-day retention). Every uploaded build output is encrypted.
+
+To add a recipe, follow [scripts/recipes/README.md](scripts/recipes/README.md),
+add a manifest pinned to a full source commit and run the offline tests with
+`python3 -I -m unittest discover -s tests -p 'test_*.py'`. The self-test's all-zero source SHA
+must be replaced with the merged fixture commit before dispatch. On the promoter
+Mac, use the run ID and attempt from which you downloaded
+`crowd-encrypted-<run-id>-<run-attempt>`. Obtain that attempt's conclusion with:
+
+```sh
+gh run view <run-id> --repo yougame-co/build --attempt <run-attempt> --json conclusion --jq .conclusion
+```
+
+Then run:
+
+```sh
+python3 -I scripts/promoter_verify.py <artifact-folder> <expected-manifest> <age-private-key-path> \
+  --run-id <run-id> --run-attempt <run-attempt> --run-conclusion <conclusion>
+```
+
+The verifier refuses any conclusion except `success`. It checks the ciphertext
+checksum and verifies provenance from this workflow on `main` using `gh`. It parses
+the verified statement and requires the SHA-256 digests of both downloaded files
+in that same statement, with a SLSA invocation ID exactly matching
+`https://github.com/yougame-co/build/actions/runs/<run-id>/attempts/<run-attempt>`.
+It then checks the canonical manifest against the expected manifest and its digest
+before decrypting into a new empty temporary directory. A binding or run mismatch
+fails at `attestation`; an expected-manifest mismatch fails at `manifest`. Neither
+decrypts. Only success prints `VERIFIED`
+with the plaintext zip path and its SHA-256; failures remove the temporary directory;
+delete that temporary directory when finished. It never extracts or publishes files.
+
 ## Rules for workflows
 
-- Triggers: `workflow_dispatch`, `workflow_call`, and scheduled maintenance (`schedule`), never `pull_request_target`.
+- Triggers: `workflow_dispatch` and scheduled maintenance (`schedule`), never `pull_request_target`.
 - `permissions:` least privilege (`contents: read` unless a job needs more).
 - Only GitHub-owned actions (`actions/*`), pinned to full commit SHAs. `timeout-minutes` on every job.
 - Builds attest their outputs (GitHub artifact attestation) so YouGame can check an upload came from a run here.
