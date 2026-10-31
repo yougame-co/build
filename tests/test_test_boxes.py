@@ -60,6 +60,15 @@ class LifecycleTests(unittest.TestCase):
             boxes.reap(now=boxes.dt.datetime(2026, 10, 31, 20, 0, tzinfo=boxes.UTC))
         az.assert_not_called()
 
+    def test_reaper_dispatch_with_null_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            event = Path(directory) / 'event.json'
+            event.write_text('{"inputs": null}')
+            with patch.dict(os.environ, {'GITHUB_EVENT_PATH': str(event)}), patch.object(boxes.sys, 'argv', ['x', 'reap']), \
+                    patch.object(boxes, 'login'), patch.object(boxes, 'reap') as reap:
+                boxes.main()
+        reap.assert_called_once()
+
     def test_down_refuses_unowned_or_absent_vm(self):
         for items in [[], [resource('ygbox-test-1', owner='human')]]:
             with patch.object(boxes, 'inventory', return_value=items), patch.object(boxes, 'delete_resources') as delete:
