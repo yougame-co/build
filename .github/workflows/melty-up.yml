@@ -1,0 +1,64 @@
+name: Melty lab up
+run-name: Melty lab up
+on:
+  workflow_dispatch:
+    inputs:
+      allow_cidr:
+        description: Your public IPv4 address followed by /32 (RDP is allowed from it only)
+        type: string
+        required: true
+      expires:
+        description: 'Deletion time, UTC, like 2026-11-01T02:00Z (30 minutes to 8 hours from now)'
+        type: string
+        required: true
+      size:
+        description: Azure VM size
+        type: choice
+        options: [Standard_D4s_v6, Standard_D2s_v6, Standard_D4as_v7, Standard_D8s_v6]
+        default: Standard_D4s_v6
+
+concurrency:
+  group: melty-up
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  box:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    environment: test-boxes
+    env:
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+      AZURE_CORE_COLLECT_TELEMETRY: 'false'
+    outputs:
+      name: ${{ steps.box.outputs.name }}
+      expires: ${{ steps.box.outputs.expires }}
+    steps:
+      - name: Mask caller address before any other work
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYMASK'
+          import json, os
+          from pathlib import Path
+          value = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text()).get('inputs', {}).get('allow_cidr', '')
+          for item in (value, value.split('/')[0]):
+              if item:
+                  escaped = item.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+                  print('::add-mask::' + escaped, flush=True)
+          PYMASK
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Lifecycle
+        id: box
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/melty-lab.py up
