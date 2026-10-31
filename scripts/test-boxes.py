@@ -26,7 +26,7 @@ IMAGES = {'windows-2025': 'MicrosoftWindowsServer:WindowsServer:2025-datacenter-
           'windows-2022': 'MicrosoftWindowsServer:WindowsServer:2022-datacenter-g2:latest',
           'ubuntu-24.04': 'Canonical:ubuntu-24_04-lts:server:latest'}
 # Per-call client timeouts (seconds): a stuck call fails with its step named and cleanup still runs inside the job.
-TIMEOUTS = {('vm', 'create'): 1200, ('vm', 'run-command'): 900}
+TIMEOUTS = {('vm', 'create'): 900, ('vm', 'run-command'): 900}
 STARTED = time.monotonic()
 
 SIZES = {'Standard_D2s_v6', 'Standard_D4s_v6', 'Standard_D2as_v7', 'Standard_D4as_v7',
@@ -162,9 +162,9 @@ def run_command(rg, name, script, timeout):
     return '\n'.join(v.get('message', '') for v in (result or {}).get('value', []))
 
 
-def guest_ssh_setup(rg, name, script, limit=900):
+def guest_ssh_setup(rg, name, script, limit=600):
     try:
-        started = run_command(rg, name, LAUNCH.replace('__SCRIPT_B64__', base64.b64encode(script.encode()).decode()), 600)
+        started = run_command(rg, name, LAUNCH.replace('__SCRIPT_B64__', base64.b64encode(script.encode()).decode()), 300)
         if 'YG_SETUP_STARTED' not in started:
             raise RuntimeError('Windows SSH setup did not start')
         step('guest setup started')
