@@ -188,6 +188,16 @@ Write-Output 'MELTY_READY'
 """
 
 
+def optional(az, label, *args):
+    # A step the box stays safe without: print its error code and carry on.
+    try:
+        az(*args)
+        return True
+    except AzureError as exc:
+        print('note: ' + label + ' unavailable (' + masked(exc.code) + ')', flush=True)
+        return False
+
+
 def run_guest(az, rg, name, script):
     return az('vm', 'run-command', 'invoke', '-g', rg, '--name', name,
               '--command-id', 'RunPowerShellScript', '--scripts', script, raw=True).strip('\r\n')
@@ -256,15 +266,16 @@ def provision(az, inputs, rg, name, created, sleep=None):
     finally:
         path.unlink(missing_ok=True)
     az('resource', 'tag', *g, '--resource-type', 'Microsoft.Compute/disks', '--name', name + '-os', '--tags', *tags)
-    az('vm', 'boot-diagnostics', 'disable', *g, '--name', name)
+    optional(az, 'boot diagnostics off', 'vm', 'boot-diagnostics', 'disable', *g, '--name', name)
     identity = (az('vm', 'show', *g, '--name', name) or {}).get('identity') or {}
     if identity.get('type') not in (None, 'None') or any(identity.get(k) for k in
             ('principalId', 'tenantId', 'userAssignedIdentities')):
         raise ValidationError('VM unexpectedly has an identity')
     # Daily at the expiry minute (UTC): compute stops at expiry even if deletion is late.
-    az('vm', 'auto-shutdown', *g, '--name', name, '--time', end.strftime('%H%M'), '--location', region)
-    az('resource', 'tag', *g, '--resource-type', 'Microsoft.DevTestLab/schedules',
-       '--name', 'shutdown-computevm-' + name, '--tags', *tags)
+    if optional(az, 'auto-shutdown', 'vm', 'auto-shutdown', *g, '--name', name, '--time', end.strftime('%H%M'),
+                '--location', region):
+        optional(az, 'auto-shutdown tag', 'resource', 'tag', *g, '--resource-type', 'Microsoft.DevTestLab/schedules',
+                 '--name', 'shutdown-computevm-' + name, '--tags', *tags)
     step('guest agent')
     wait_guest_agent(az, rg, name, sleep=sleep)
     step('guest hardening')
@@ -306,10 +317,20 @@ def down(az, name, rg):
                 raise
             time.sleep(10)
     ids = {r['id'] for r in selected}
-    if any(r['id'] in ids or ((r.get('tags') or {}).get('owner') == 'agent' and
-           (r.get('tags') or {}).get('box') == name) for r in az('resource', 'list', '-g', rg)):
-        raise ValidationError('Resources remain; rerun melty-down')
-    return len(selected)
+    for attempt in range(4):
+        # Resource listings lag deletes by up to a minute.
+        if not any(r['id'] in ids or ((r.get('tags') or {}).get('owner') == 'agent' and
+                   (r.get('tags') or {}).get('box') == name) for r in az('resource', 'list', '-g', rg)):
+            return len(selected)
+        if attempt < 3:
+            time.sleep(20)
+    raise ValidationError('Resources remain; rerun melty-down')
+
+
+def melty_boxes(az, rg):
+    return sorted({(r.get('tags') or {}).get('box') for r in az('resource', 'list', '-g', rg)
+                   if (r.get('tags') or {}).get('owner') == 'agent' and (r.get('tags') or {}).get('purpose') == 'melty-lab'
+                   and re.fullmatch(r'melty-lab-[0-9a-f]{6}', str((r.get('tags') or {}).get('box')))})
 
 
 def report(fields):
@@ -344,19 +365,24 @@ def main(argv=None, az=None, now=None):
         step('login')
         login(az)
         check_free(az, rg, name)
+        print('name: ' + name, flush=True)
         try:
             end = provision(az, inputs, rg, name, created)
-        except Exception:
+        except Exception as exc:
+            print('failed: ' + (masked(str(exc)) if isinstance(exc, (ValidationError, AzureError))
+                                else type(exc).__name__), flush=True)
             step('cleanup after failure')
             down(az, name, rg)
             raise
         report({'name': name, 'expires': stamp(end), 'resource_group': rg})
     else:
-        name = name_ok(inputs.get('name'))
+        # 'all' removes every agent-owned melty-lab box (failed attempts included).
+        names = None if inputs.get('name') == 'all' else [name_ok(inputs.get('name'))]
         step('login')
         login(az)
-        count = down(az, name, rg)
-        report({'name': name, 'deleted': str(count)})
+        names = names or melty_boxes(az, rg)
+        count = sum(down(az, name, rg) for name in names)
+        report({'name': ','.join(names) or 'none', 'deleted': str(count)})
 
 
 if __name__ == '__main__':

@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       name:
-        description: Box name from melty-up (melty-lab-xxxxxx)
+        description: Box name from melty-up (melty-lab-xxxxxx), or all for every melty-lab box
         type: string
         required: true
 
