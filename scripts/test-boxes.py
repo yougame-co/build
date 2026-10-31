@@ -420,7 +420,8 @@ def up(inputs):
 
 
 def main():
-    inputs = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text()).get('inputs', {})
+    # A dispatch of a workflow without inputs (the reaper) carries "inputs": null.
+    inputs = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text()).get('inputs') or {}
     if inputs.get('allow_cidr'):
         mask(inputs['allow_cidr'])
         mask(inputs['allow_cidr'].split('/')[0])
