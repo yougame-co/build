@@ -1,0 +1,133 @@
+name: Crowd build
+on:
+  workflow_dispatch:
+    inputs:
+      manifest:
+        description: Manifest path in this repository (manifests/<name>.json)
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      manifest:
+        description: Manifest path in this repository (manifests/<name>.json)
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      manifest: ${{ steps.manifest.outputs.manifest }}
+      manifest_digest: ${{ steps.manifest.outputs.manifest_digest }}
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: yougame-co/build
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Validate manifest before any source work
+        id: manifest
+        env:
+          MANIFEST_PATH: ${{ inputs.manifest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I scripts/crowd_manifest.py "$MANIFEST_PATH"
+      - name: Fetch pinned public source and run recipe
+        env:
+          SOURCE_REPO: ${{ steps.manifest.outputs.repo }}
+          SOURCE_SHA: ${{ steps.manifest.outputs.sha }}
+          RECIPE: ${{ steps.manifest.outputs.recipe }}
+          GIT_TERMINAL_PROMPT: '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC=$(mktemp -d "$RUNNER_TEMP/crowd-source.XXXXXX")
+          OUT="$RUNNER_TEMP/crowd-output"
+          mkdir "$OUT"
+          git init "$SRC"
+          git -C "$SRC" remote add origin "$SOURCE_REPO"
+          git -C "$SRC" -c credential.helper= -c core.hooksPath=/dev/null fetch --depth 1 origin "$SOURCE_SHA"
+          git -C "$SRC" -c core.hooksPath=/dev/null checkout --detach FETCH_HEAD
+          test "$(git -C "$SRC" rev-parse HEAD)" = "$SOURCE_SHA"
+          bash "scripts/recipes/$RECIPE.sh" "$SRC" "$OUT"
+      - name: Zip output deterministically
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I scripts/crowd_zip.py "$RUNNER_TEMP/crowd-output" "$RUNNER_TEMP/build.zip"
+      - name: Install age and encrypt zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s keys/artifacts.age.pub
+          sudo apt-get update
+          sudo apt-get install -y age
+          age -R keys/artifacts.age.pub -o "$RUNNER_TEMP/build.zip.age" "$RUNNER_TEMP/build.zip"
+      - name: Hand encrypted zip to attest job
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: crowd-handoff-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/build.zip.age
+          retention-days: 1
+          if-no-files-found: error
+
+  attest:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout workflow repository for manifest validation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: yougame-co/build
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Download encrypted zip
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: crowd-handoff-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/crowd-handoff
+      - name: Hash ciphertext and write validated manifest
+        env:
+          VALIDATED_MANIFEST: ${{ needs.build.outputs.manifest }}
+          MANIFEST_DIGEST: ${{ needs.build.outputs.manifest_digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/crowd-release"
+          mv "$RUNNER_TEMP/crowd-handoff/build.zip.age" "$RUNNER_TEMP/crowd-release/build.zip.age"
+          (cd "$RUNNER_TEMP/crowd-release" && sha256sum build.zip.age) > "$RUNNER_TEMP/crowd-release/build.zip.age.sha256"
+          python3 -I - <<'PY'
+          import hashlib, os, runpy
+          from pathlib import Path
+          validate = runpy.run_path('scripts/crowd_manifest.py')['canonical_manifest']
+          canonical = validate(os.environ['VALIDATED_MANIFEST'])
+          if hashlib.sha256(canonical).hexdigest() != os.environ['MANIFEST_DIGEST']:
+              raise SystemExit('manifest digest mismatch')
+          (Path(os.environ['RUNNER_TEMP']) / 'crowd-release/manifest.json').write_bytes(canonical)
+          PY
+      - name: Attest the ciphertext
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/crowd-release/build.zip.age
+      - name: Upload encrypted release
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: crowd-encrypted-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/crowd-release/build.zip.age
+            ${{ runner.temp }}/crowd-release/build.zip.age.sha256
+            ${{ runner.temp }}/crowd-release/manifest.json
+          retention-days: 7
+          if-no-files-found: error

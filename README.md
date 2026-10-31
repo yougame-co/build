@@ -26,6 +26,29 @@ workflows here must not upload build outputs.
 
 A notice against an entry takes that entry down within 24 hours.
 
+## Crowd builds
+
+`crowd-build.yml` accepts a repository manifest through manual dispatch or a
+reusable workflow call. Its build job has only `contents: read`: it validates the
+manifest, fetches the pinned public source, runs the recipe, and encrypts the zip
+with age to `keys/artifacts.age.pub` from this repository at the workflow commit.
+It uploads only `build.zip.age` for the attest job (one-day retention). A separate
+attest job runs no source or recipe code and never decrypts: it hashes and attests
+the ciphertext with GitHub build provenance. Its final artifact contains only
+`build.zip.age`, `build.zip.age.sha256` and the validated `manifest.json`
+(seven-day retention). Every uploaded build output is encrypted.
+
+To add a recipe, follow [scripts/recipes/README.md](scripts/recipes/README.md),
+add a manifest pinned to a full source commit and run the offline tests with
+`python3 -I -m unittest discover -s tests`. The self-test's all-zero source SHA
+must be replaced with the merged fixture commit before dispatch. On the promoter
+Mac, run `python3 -I scripts/promoter_verify.py <artifact-folder> <expected-manifest>
+<age-private-key-path>`. It checks the ciphertext checksum, verifies provenance
+from this workflow on `main` using `gh`, and checks the canonical manifest before
+decrypting into a new empty temporary directory. Only success prints `VERIFIED`
+with the plaintext zip path and its SHA-256; failures remove the temporary directory;
+delete that temporary directory when finished. It never extracts or publishes files.
+
 ## Rules for workflows
 
 - Triggers: `workflow_dispatch`, `workflow_call`, and scheduled maintenance (`schedule`), never `pull_request_target`.
