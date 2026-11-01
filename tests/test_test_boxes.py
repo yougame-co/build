@@ -49,6 +49,17 @@ class LifecycleTests(unittest.TestCase):
             boxes.reap(NOW)
         self.assertEqual(delete.call_args.args[0], [expired, ancient, missing, orphan_disk])
 
+    def test_reaper_caps_gpu_boxes_by_their_size_tag(self):
+        extended = (NOW + dt.timedelta(days=1)).isoformat()
+        gpu = resource('ygbox-gpu-5', box='ygbox-gpu-5', size='Standard_NC4as_T4_v3', expires=extended)
+        gpu['createdTime'] = (NOW - dt.timedelta(hours=3)).isoformat()
+        cpu = resource('ygbox-cpu-6', box='ygbox-cpu-6', size='Standard_D2s_v6', expires=extended)
+        cpu['createdTime'] = (NOW - dt.timedelta(hours=3)).isoformat()
+        young_gpu = resource('ygbox-gpu-7', box='ygbox-gpu-7', size='Standard_NC4as_T4_v3', expires=extended)
+        with patch.object(boxes, 'report_leftovers'), patch.object(boxes, 'inventory', return_value=[gpu, cpu, young_gpu]), patch.object(boxes, 'delete_resources') as delete:
+            boxes.reap(NOW)
+        self.assertEqual(delete.call_args.args[0], [gpu])
+
     def test_reaper_reads_null_system_data_and_missing_created_time(self):
         # Some resources (an auto-shutdown schedule) come back with createdTime and systemData null.
         sched = resource('shutdown-computevm-x', 'microsoft.devtestlab/schedules', box='melty-lab-abc123')
@@ -170,6 +181,7 @@ class LifecycleTests(unittest.TestCase):
                             self.assertEqual('--admin-password' in vm_call, os_name.startswith('windows-'))
                             self.assertIn(boxes.IMAGES[os_name], vm_call)
                             self.assertIn('Premium_LRS', vm_call)
+                            self.assertIn('size=Standard_D2s_v6', vm_call)
                             self.assertEqual(any(c[:3] == ('vm', 'run-command', 'invoke') for c in calls), os_name.startswith('windows-'))
                             if os_name.startswith('windows-'):
                                 launch = next(c for c in calls if c[:3] == ('vm', 'run-command', 'invoke'))
@@ -241,6 +253,26 @@ class LifecycleTests(unittest.TestCase):
                 with patch.object(boxes, 'login') as login, self.assertRaisesRegex(boxes.ValidationError, 'Invalid os'), contextlib.redirect_stdout(io.StringIO()):
                     boxes.up({'label': 'test', 'os': 'windows-2019', 'allow_cidr': '8.8.8.8/32'})
                 login.assert_not_called()
+            finally:
+                os.chdir(old)
+
+    def test_gpu_size_lifetime_is_capped_before_login(self):
+        with tempfile.TemporaryDirectory() as directory:
+            old = os.getcwd()
+            try:
+                os.chdir(directory)
+                Path('keys').mkdir()
+                Path('keys/agent-ssh.pub').write_text('ssh-ed25519 AAAA synthetic-test\n')
+                with patch.object(boxes, 'login') as login, contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaisesRegex(boxes.ValidationError, 'at most 2 hours'):
+                        boxes.up({'label': 'gpu', 'os': 'ubuntu-24.04', 'size': 'Standard_NC4as_T4_v3',
+                                  'hours': '3', 'allow_cidr': '8.8.8.8/32'})
+                    with self.assertRaisesRegex(boxes.ValidationError, 'Invalid size'):
+                        boxes.up({'label': 'gpu', 'size': 'Standard_NC8as_T4_v3', 'hours': '1',
+                                  'allow_cidr': '8.8.8.8/32'})
+                login.assert_not_called()
+                self.assertIn('Standard_NC4as_T4_v3', boxes.SIZES)
+                self.assertEqual(boxes.GPU_MAX_HOURS, {'Standard_NC4as_T4_v3': 2})
             finally:
                 os.chdir(old)
 
