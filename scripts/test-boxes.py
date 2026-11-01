@@ -31,7 +31,11 @@ TIMEOUTS = {('vm', 'create'): 900, ('vm', 'run-command'): 900}
 STARTED = time.monotonic()
 
 SIZES = {'Standard_D2s_v6', 'Standard_D4s_v6', 'Standard_D2as_v7', 'Standard_D4as_v7',
-         'Standard_D2ps_v6', 'Standard_D4ps_v6', 'Standard_NV4as_v4', 'Standard_NV8as_v4'}
+         'Standard_D2ps_v6', 'Standard_D4ps_v6', 'Standard_NV4as_v4', 'Standard_NV8as_v4',
+         'Standard_NC4as_T4_v3'}
+# NVIDIA T4 (4 vCPU, pay-as-you-go eastus ~$0.53/h Linux, ~$0.71/h Windows) for tests that need a real GPU only
+# (Luis 10-31: "make sure not use much more gpu than is necessary. Be cost mindful"): lifetime capped at 2 hours.
+GPU_MAX_HOURS = {'Standard_NC4as_T4_v3': 2}
 
 
 class ValidationError(Exception):
@@ -332,9 +336,11 @@ def up(inputs):
     if not re.fullmatch(r'(?:[1-9]|1[0-2])', str(hours)):
         raise ValidationError('hours must be an integer from 1 to 12')
     size, region = inputs.get('size', 'Standard_D2s_v6'), inputs.get('region', 'eastus')
-    # Costed sizes only (security-lead 10-31): pay-as-you-go eastus ~$0.04-0.53/h; anything else needs a costed PR.
+    # Costed sizes only (security-lead 10-31): pay-as-you-go eastus ~$0.04-0.71/h; anything else needs a costed PR.
     if size not in SIZES or not re.fullmatch(r'[a-z0-9]+', region):
         raise ValidationError('Invalid size or region (sizes: ' + ', '.join(sorted(SIZES)) + ')')
+    if int(hours) > GPU_MAX_HOURS.get(size, 12):
+        raise ValidationError(f'{size} boxes live at most {GPU_MAX_HOURS[size]} hours')
     # Keep only key type/base64, never comments identifying its owner. Reject options.
     key_parts = key_file.read_text().strip().split()
     if len(key_file.read_text().strip().splitlines()) != 1 or len(key_parts) < 2:

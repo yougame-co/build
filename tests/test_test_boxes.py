@@ -244,6 +244,26 @@ class LifecycleTests(unittest.TestCase):
             finally:
                 os.chdir(old)
 
+    def test_gpu_size_lifetime_is_capped_before_login(self):
+        with tempfile.TemporaryDirectory() as directory:
+            old = os.getcwd()
+            try:
+                os.chdir(directory)
+                Path('keys').mkdir()
+                Path('keys/agent-ssh.pub').write_text('ssh-ed25519 AAAA synthetic-test\n')
+                with patch.object(boxes, 'login') as login, contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaisesRegex(boxes.ValidationError, 'at most 2 hours'):
+                        boxes.up({'label': 'gpu', 'os': 'ubuntu-24.04', 'size': 'Standard_NC4as_T4_v3',
+                                  'hours': '3', 'allow_cidr': '8.8.8.8/32'})
+                    with self.assertRaisesRegex(boxes.ValidationError, 'Invalid size'):
+                        boxes.up({'label': 'gpu', 'size': 'Standard_NC8as_T4_v3', 'hours': '1',
+                                  'allow_cidr': '8.8.8.8/32'})
+                login.assert_not_called()
+                self.assertIn('Standard_NC4as_T4_v3', boxes.SIZES)
+                self.assertEqual(boxes.GPU_MAX_HOURS, {'Standard_NC4as_T4_v3': 2})
+            finally:
+                os.chdir(old)
+
     def test_stuck_cli_call_times_out_with_its_step_named(self):
         with patch.object(boxes.subprocess, 'run', side_effect=boxes.subprocess.TimeoutExpired('az', 1)) as run:
             with self.assertRaisesRegex(RuntimeError, r'^Azure operation failed: vm create \[Timeout\]$'):
