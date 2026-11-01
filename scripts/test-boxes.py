@@ -289,9 +289,11 @@ def reap(now=None):
                    timestamp((resource.get('systemData') or {}).get('createdAt')) or
                    timestamp(tags.get('created')))
         # Fail closed for malformed/missing lifecycle timestamps. Server creation
-        # time takes precedence so extending expires cannot bypass the 12h cap.
+        # time takes precedence so extending expires cannot bypass the 12h cap
+        # (a GPU size's own cap, from its size tag; desktop-release 11-01).
+        cap = GPU_MAX_HOURS.get(tags.get('size', ''), 12)
         if (expires is None or expires <= now or created is None or
-                created <= now - dt.timedelta(hours=12)):
+                created <= now - dt.timedelta(hours=cap)):
             selected.append(resource)
             box = tags.get('box', '')
             if re.fullmatch(r'ygbox-[a-z0-9-]+-[0-9]+', box):
@@ -355,7 +357,7 @@ def up(inputs):
     expires = (now + dt.timedelta(hours=int(hours))).strftime('%Y-%m-%dT%H:%M:%SZ')
     tags = ['owner=agent', 'purpose=' + label, 'expires=' + expires,
             'run=' + os.environ['GITHUB_RUN_ID'], 'box=' + name,
-            'created=' + now.strftime('%Y-%m-%dT%H:%M:%SZ')]
+            'created=' + now.strftime('%Y-%m-%dT%H:%M:%SZ'), 'size=' + size]
     rg = ['--resource-group', os.environ['AZURE_RESOURCE_GROUP']]
     common = [*rg, '--location', region, '--tags', *tags]
     # A rerun must never reset/overwrite a live VM's password or SSH configuration.

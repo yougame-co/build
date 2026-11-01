@@ -49,6 +49,17 @@ class LifecycleTests(unittest.TestCase):
             boxes.reap(NOW)
         self.assertEqual(delete.call_args.args[0], [expired, ancient, missing, orphan_disk])
 
+    def test_reaper_caps_gpu_boxes_by_their_size_tag(self):
+        extended = (NOW + dt.timedelta(days=1)).isoformat()
+        gpu = resource('ygbox-gpu-5', box='ygbox-gpu-5', size='Standard_NC4as_T4_v3', expires=extended)
+        gpu['createdTime'] = (NOW - dt.timedelta(hours=3)).isoformat()
+        cpu = resource('ygbox-cpu-6', box='ygbox-cpu-6', size='Standard_D2s_v6', expires=extended)
+        cpu['createdTime'] = (NOW - dt.timedelta(hours=3)).isoformat()
+        young_gpu = resource('ygbox-gpu-7', box='ygbox-gpu-7', size='Standard_NC4as_T4_v3', expires=extended)
+        with patch.object(boxes, 'report_leftovers'), patch.object(boxes, 'inventory', return_value=[gpu, cpu, young_gpu]), patch.object(boxes, 'delete_resources') as delete:
+            boxes.reap(NOW)
+        self.assertEqual(delete.call_args.args[0], [gpu])
+
     def test_reaper_reads_null_system_data_and_missing_created_time(self):
         # Some resources (an auto-shutdown schedule) come back with createdTime and systemData null.
         sched = resource('shutdown-computevm-x', 'microsoft.devtestlab/schedules', box='melty-lab-abc123')
@@ -170,6 +181,7 @@ class LifecycleTests(unittest.TestCase):
                             self.assertEqual('--admin-password' in vm_call, os_name.startswith('windows-'))
                             self.assertIn(boxes.IMAGES[os_name], vm_call)
                             self.assertIn('Premium_LRS', vm_call)
+                            self.assertIn('size=Standard_D2s_v6', vm_call)
                             self.assertEqual(any(c[:3] == ('vm', 'run-command', 'invoke') for c in calls), os_name.startswith('windows-'))
                             if os_name.startswith('windows-'):
                                 launch = next(c for c in calls if c[:3] == ('vm', 'run-command', 'invoke'))
