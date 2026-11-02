@@ -69,10 +69,15 @@ def az(*args, timeout=None):
     if result.returncode:
         # Azure errors can repeat passwords, request bodies or network rules: keep only the error CODE
         # (letters only, e.g. AuthorizationFailed), which is safe for a public log.
-        code = re.search(r'\(([A-Z][A-Za-z]{2,63})\)|"code":\s*"([A-Z][A-Za-z]{2,63})"|Code: ([A-Z][A-Za-z]{2,63})', result.stderr or '')
-        if not code and re.search(r'(?i)usage error|unrecognized arguments|the following arguments are required|invalid choice', result.stderr or ''):
-            code = re.search(r'(CliUsage)', 'CliUsage')
-        code = next((g for g in code.groups() if g), None) if code else None
+        # Every code, outer first: a wrapper such as InvalidTemplateDeployment hides the cause (QuotaExceeded, SkuNotAvailable).
+        codes = []
+        for match in re.finditer(r'\(([A-Z][A-Za-z]{2,63})\)|"code":\s*"([A-Z][A-Za-z]{2,63})"|Code: ([A-Z][A-Za-z]{2,63})', result.stderr or ''):
+            found = next(g for g in match.groups() if g)
+            if found not in codes:
+                codes.append(found)
+        if not codes and re.search(r'(?i)usage error|unrecognized arguments|the following arguments are required|invalid choice', result.stderr or ''):
+            codes = ['CliUsage']
+        code = '/'.join(codes[:6]) or None
         detail = ''
         if args and args[0] == 'network':
             # Network commands carry no secrets: show the CLI's own first error line, with every IP and GUID masked
