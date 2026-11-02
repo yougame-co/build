@@ -137,6 +137,15 @@ class LifecycleTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, '^Azure operation failed: vm create$'):
                 boxes.az('vm', 'create', '--admin-password', 'synthetic-placeholder')
 
+    def test_cli_error_keeps_every_code_but_no_text(self):
+        with patch.object(boxes.subprocess, 'run') as run:
+            run.return_value.returncode = 1
+            run.return_value.stdout = ''
+            run.return_value.stderr = ('ERROR: {"code": "InvalidTemplateDeployment", "message": "PRIVATE 10.0.0.4", "details": '
+                                       '[{"code": "QuotaExceeded", "message": "PRIVATE"}, {"code": "QuotaExceeded"}]}')
+            with self.assertRaisesRegex(RuntimeError, r'^Azure operation failed: vm create \[InvalidTemplateDeployment/QuotaExceeded\]$'):
+                boxes.az('vm', 'create', '--admin-password', 'synthetic-placeholder')
+
     def test_up_both_operating_systems_and_failed_guest_cleanup(self):
         for os_name, fail_guest in [('windows-2025', False), ('windows-2022', False), ('ubuntu-24.04', False), ('windows-2025', True)]:
             with self.subTest(os=os_name, fail_guest=fail_guest), tempfile.TemporaryDirectory() as directory:
