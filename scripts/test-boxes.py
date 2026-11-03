@@ -27,15 +27,24 @@ IMAGES = {'windows-2025': 'MicrosoftWindowsServer:WindowsServer:2025-datacenter-
           'windows-2022': 'MicrosoftWindowsServer:WindowsServer:2022-datacenter-g2:latest',
           'ubuntu-24.04': 'Canonical:ubuntu-24_04-lts:server:latest'}
 # Per-call client timeouts (seconds): a stuck call fails with its step named and cleanup still runs inside the job.
-TIMEOUTS = {('vm', 'create'): 900, ('vm', 'run-command'): 900}
+TIMEOUTS = {('vm', 'create'): 900, ('vm', 'run-command'): 900, ('vm', 'extension'): 1500}
 STARTED = time.monotonic()
 
 SIZES = {'Standard_D2s_v6', 'Standard_D4s_v6', 'Standard_D2as_v7', 'Standard_D4as_v7',
          'Standard_D2ps_v6', 'Standard_D4ps_v6', 'Standard_NV4as_v4', 'Standard_NV8as_v4',
-         'Standard_NC4as_T4_v3'}
-# NVIDIA T4 (4 vCPU, pay-as-you-go eastus ~$0.53/h Linux, ~$0.71/h Windows) for tests that need a real GPU only
-# (Luis 10-31: "make sure not use much more gpu than is necessary. Be cost mindful"): lifetime capped at 2 hours.
-GPU_MAX_HOURS = {'Standard_NC4as_T4_v3': 2}
+         'Standard_NC4as_T4_v3', 'Standard_NV6ads_A10_v5', 'Standard_NV4ads_V710_v5'}
+# Real GPUs for tests that need one only (Luis 10-31: "make sure not use much more gpu than is necessary. Be cost
+# mindful"; 11-03: "We don't need machine learning level just enough to run melee"): lifetime capped at 2 hours.
+# Pay-as-you-go eastus, Linux / Windows / Windows Spot ($/h, retail price API 11-03): NC4as_T4_v3 (NVIDIA T4)
+# 0.526 / 0.71 / 0.22; NV6ads_A10_v5 (1/6 NVIDIA A10) 0.454 / 0.73 / 0.13; NV4ads_V710_v5 (1/6 AMD V710)
+# 0.333 / 0.517 / 0.10; NV4as_v4 (1/8 AMD MI25) Windows Spot 0.08.
+GPU_MAX_HOURS = {'Standard_NC4as_T4_v3': 2, 'Standard_NV6ads_A10_v5': 2, 'Standard_NV4ads_V710_v5': 2,
+                 'Standard_NV4as_v4': 2, 'Standard_NV8as_v4': 2}
+# Microsoft's GPU driver VM extensions (publisher Microsoft.HpcCompute), Windows boxes only: Linux GPU boxes take
+# the agents' own prep (box-prep-linux-gpu.sh).
+GPU_DRIVERS = {'Standard_NC4as_T4_v3': 'NvidiaGpuDriverWindows', 'Standard_NV6ads_A10_v5': 'NvidiaGpuDriverWindows',
+               'Standard_NV4ads_V710_v5': 'AmdGpuDriverWindows', 'Standard_NV4as_v4': 'AmdGpuDriverWindows',
+               'Standard_NV8as_v4': 'AmdGpuDriverWindows'}
 
 
 class ValidationError(Exception):
@@ -348,6 +357,14 @@ def up(inputs):
         raise ValidationError('Invalid size or region (sizes: ' + ', '.join(sorted(SIZES)) + ')')
     if int(hours) > GPU_MAX_HOURS.get(size, 12):
         raise ValidationError(f'{size} boxes live at most {GPU_MAX_HOURS[size]} hours')
+    # Spot: a separate, usually larger quota pool at a fraction of the price; Azure may evict the box at any time.
+    # Deallocate (not Delete) on eviction keeps the VM and its tagged disk under box-down and the reaper.
+    spot = str(inputs.get('spot', 'false')).lower()
+    driver = str(inputs.get('gpu_driver', 'false')).lower()
+    if spot not in ('true', 'false') or driver not in ('true', 'false'):
+        raise ValidationError('spot and gpu_driver must be true or false')
+    if driver == 'true' and (size not in GPU_DRIVERS or not os_name.startswith('windows-')):
+        raise ValidationError('gpu_driver needs a Windows box with a GPU size')
     # Keep only key type/base64, never comments identifying its owner. Reject options.
     key_parts = key_file.read_text().strip().split()
     if len(key_file.read_text().strip().splitlines()) != 1 or len(key_parts) < 2:
@@ -362,7 +379,8 @@ def up(inputs):
     expires = (now + dt.timedelta(hours=int(hours))).strftime('%Y-%m-%dT%H:%M:%SZ')
     tags = ['owner=agent', 'purpose=' + label, 'expires=' + expires,
             'run=' + os.environ['GITHUB_RUN_ID'], 'box=' + name,
-            'created=' + now.strftime('%Y-%m-%dT%H:%M:%SZ'), 'size=' + size]
+            'created=' + now.strftime('%Y-%m-%dT%H:%M:%SZ'), 'size=' + size,
+            'priority=' + ('spot' if spot == 'true' else 'regular')]
     rg = ['--resource-group', os.environ['AZURE_RESOURCE_GROUP']]
     common = [*rg, '--location', region, '--tags', *tags]
     # A rerun must never reset/overwrite a live VM's password or SSH configuration.
@@ -397,6 +415,8 @@ def up(inputs):
                    '--security-type', 'Standard',
                    '--os-disk-delete-option', 'Detach', '--nic-delete-option', 'Detach']
         vm_args += ['--image', IMAGES[os_name]]
+        if spot == 'true':
+            vm_args += ['--priority', 'Spot', '--eviction-policy', 'Deallocate', '--max-price', '-1']
         if windows:
             password = 'Yg9!' + secrets.token_urlsafe(32)
             mask(password)
@@ -412,6 +432,15 @@ def up(inputs):
             wait_guest_agent(rg, name)
             step('guest ssh setup')
             guest_ssh_setup(rg, name, Path('scripts/test-boxes-windows.ps1').read_text().replace('__PUBLIC_KEY__', key))
+        if driver == 'true':
+            # A driver that fails to install leaves a working box without GPU acceleration: say so, keep the box.
+            step('gpu driver')
+            try:
+                az('vm', 'extension', 'set', *rg, '--vm-name', name, '--name', GPU_DRIVERS[size],
+                   '--publisher', 'Microsoft.HpcCompute')
+                print('gpu_driver: ' + GPU_DRIVERS[size] + ' installed', flush=True)
+            except RuntimeError as error:
+                print('gpu_driver: FAILED ' + str(error), flush=True)
         ip = az('network', 'public-ip', 'show', *rg, '--name', name + '-ip')['ipAddress']
         step('ready')
     except Exception:

@@ -116,4 +116,6 @@ requesting a larger or GPU machine.
 
 Allowed sizes (10-31, eastus capacity): Standard_D2s_v5, Standard_D4s_v5 (Windows/Linux x64), Standard_D4ps_v5 (ARM), Standard_NC4as_T4_v3 (GPU, needs quota). The B2s price table above is history; check current prices before a long run.
 
+GPU sizes (11-03; each needs its family's quota in the region, capped at 2 hours): Standard_NC4as_T4_v3 (NVIDIA T4), Standard_NV6ads_A10_v5 (1/6 NVIDIA A10), Standard_NV4ads_V710_v5 (1/6 AMD V710), Standard_NV4as_v4 / NV8as_v4 (AMD MI25 slices). The full list and eastus prices are in `SIZES` and the comment beside it in `scripts/test-boxes.py`. `spot: true` uses the Spot quota pool (a separate regional pool, about a fifth of the price; Azure may evict the box, which deallocates it and keeps it under box-down and the reaper). `gpu_driver: true` installs Microsoft's NVIDIA or AMD GPU driver extension on a Windows GPU box after SSH setup. A failed driver install leaves the box up and prints `gpu_driver: FAILED [code]`.
+
 Allowed sizes from 10-31 2:24 AM (pay-as-you-go quota, 10 vCPU per family per US region): Standard_D2s_v6 (default) / D4s_v6, D2as_v7 / D4as_v7 (Windows/Linux x64), D2ps_v6 / D4ps_v6 (ARM; Windows 11 ARM64 image), NV4as_v4 / NV8as_v4 (AMD GPU slice, Windows). v5 families and NCasT4 need a support ticket.
