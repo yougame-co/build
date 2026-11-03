@@ -28,6 +28,16 @@ on:
         description: Your public IPv4 address followed by /32
         type: string
         required: true
+      spot:
+        description: Spot priority (separate quota pool, cheaper, Azure may evict the box)
+        type: choice
+        options: ['false', 'true']
+        default: 'false'
+      gpu_driver:
+        description: Install Microsoft's GPU driver extension (Windows GPU sizes only)
+        type: choice
+        options: ['false', 'true']
+        default: 'false'
 
 concurrency:
   group: box-up-${{ inputs.label }}

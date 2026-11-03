@@ -279,11 +279,75 @@ class LifecycleTests(unittest.TestCase):
                     with self.assertRaisesRegex(boxes.ValidationError, 'Invalid size'):
                         boxes.up({'label': 'gpu', 'size': 'Standard_NC8as_T4_v3', 'hours': '1',
                                   'allow_cidr': '8.8.8.8/32'})
+                    with self.assertRaisesRegex(boxes.ValidationError, 'at most 2 hours'):
+                        boxes.up({'label': 'gpu', 'size': 'Standard_NV6ads_A10_v5', 'hours': '3',
+                                  'allow_cidr': '8.8.8.8/32'})
+                    with self.assertRaisesRegex(boxes.ValidationError, 'true or false'):
+                        boxes.up({'label': 'gpu', 'size': 'Standard_NV6ads_A10_v5', 'hours': '1', 'spot': 'yes',
+                                  'allow_cidr': '8.8.8.8/32'})
+                    with self.assertRaisesRegex(boxes.ValidationError, 'gpu_driver needs a Windows box'):
+                        boxes.up({'label': 'gpu', 'os': 'ubuntu-24.04', 'size': 'Standard_NV6ads_A10_v5',
+                                  'hours': '1', 'gpu_driver': 'true', 'allow_cidr': '8.8.8.8/32'})
+                    with self.assertRaisesRegex(boxes.ValidationError, 'gpu_driver needs a Windows box'):
+                        boxes.up({'label': 'gpu', 'size': 'Standard_D2s_v6', 'hours': '1', 'gpu_driver': 'true',
+                                  'allow_cidr': '8.8.8.8/32'})
                 login.assert_not_called()
                 self.assertIn('Standard_NC4as_T4_v3', boxes.SIZES)
-                self.assertEqual(boxes.GPU_MAX_HOURS, {'Standard_NC4as_T4_v3': 2})
+                # Every GPU size is capped and every Windows GPU driver names a GPU size.
+                self.assertEqual({s for s in boxes.SIZES if '_N' in s}, set(boxes.GPU_MAX_HOURS))
+                self.assertTrue(set(boxes.GPU_DRIVERS) <= set(boxes.GPU_MAX_HOURS))
+                self.assertEqual(set(boxes.GPU_MAX_HOURS.values()), {2})
             finally:
                 os.chdir(old)
+
+    def test_spot_and_gpu_driver_options(self):
+        for spot, driver_fails in [('true', False), ('false', True)]:
+            with self.subTest(spot=spot, driver_fails=driver_fails), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / 'keys').mkdir()
+                (root / 'keys/agent-ssh.pub').write_text('ssh-ed25519 AAAA synthetic-test\n')
+                (root / 'scripts').mkdir()
+                (root / 'scripts/test-boxes-windows.ps1').write_text('__PUBLIC_KEY__')
+                vm = resource('ygbox-gpu-123', box='ygbox-gpu-123')
+                disk = resource('ygbox-gpu-123-os', boxes.DISK_TYPE, box='ygbox-gpu-123')
+                calls = []
+
+                def fake_az(*args, timeout=None):
+                    calls.append(args)
+                    if args[:3] == ('network', 'public-ip', 'show'):
+                        return {'ipAddress': '192.0.2.1'}
+                    if args[:3] == ('vm', 'run-command', 'invoke'):
+                        script = args[args.index('--scripts') + 1]
+                        if 'YG_SETUP_STARTED' in script:
+                            return {'value': [{'message': 'YG_SETUP_STARTED'}]}
+                        return {'value': [{'message': 'YG_SSH_READY'}]}
+                    if args[:2] == ('vm', 'get-instance-view'):
+                        return {'instanceView': {'vmAgent': {'statuses': [{'displayStatus': 'Ready'}]}}}
+                    if args[:3] == ('vm', 'extension', 'set') and driver_fails:
+                        raise RuntimeError('Azure operation failed: vm extension [VMExtensionProvisioningError]')
+                    return {}
+
+                old = os.getcwd()
+                try:
+                    os.chdir(root)
+                    out = io.StringIO()
+                    with patch.dict(os.environ, {'GITHUB_RUN_ID': '123', 'AZURE_RESOURCE_GROUP': 'mock', 'GITHUB_OUTPUT': str(root/'output'), 'GITHUB_STEP_SUMMARY': str(root/'summary')}), patch.object(boxes, 'login'), patch.object(boxes, 'az', side_effect=fake_az), patch.object(boxes, 'inventory', side_effect=[[], [vm, disk]]), patch.object(boxes.time, 'sleep'), contextlib.redirect_stdout(out):
+                        boxes.up({'label': 'gpu', 'size': 'Standard_NV6ads_A10_v5', 'hours': '1', 'spot': spot,
+                                  'gpu_driver': 'true', 'allow_cidr': '8.8.8.8/32'})
+                    vm_call = next(c for c in calls if c[:2] == ('vm', 'create'))
+                    self.assertEqual('--priority' in vm_call, spot == 'true')
+                    if spot == 'true':
+                        self.assertEqual(vm_call[vm_call.index('--eviction-policy') + 1], 'Deallocate')
+                    self.assertIn('priority=' + ('spot' if spot == 'true' else 'regular'), vm_call)
+                    ext = next(c for c in calls if c[:3] == ('vm', 'extension', 'set'))
+                    self.assertEqual(ext[ext.index('--name') + 1], 'NvidiaGpuDriverWindows')
+                    self.assertEqual(ext[ext.index('--publisher') + 1], 'Microsoft.HpcCompute')
+                    # A failed driver keeps the box: outputs written, nothing deleted.
+                    self.assertTrue((root/'output').exists())
+                    self.assertFalse(any(c[:2] == ('resource', 'delete') for c in calls))
+                    self.assertIn('gpu_driver: FAILED' if driver_fails else 'gpu_driver: NvidiaGpuDriverWindows installed', out.getvalue())
+                finally:
+                    os.chdir(old)
 
     def test_stuck_cli_call_times_out_with_its_step_named(self):
         with patch.object(boxes.subprocess, 'run', side_effect=boxes.subprocess.TimeoutExpired('az', 1)) as run:
