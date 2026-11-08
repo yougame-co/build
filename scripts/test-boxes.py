@@ -38,6 +38,13 @@ SIZES = {'Standard_D2s_v6', 'Standard_D4s_v6', 'Standard_D2as_v7', 'Standard_D4a
 # Pay-as-you-go eastus, Linux / Windows / Windows Spot ($/h, retail price API 11-03): NC4as_T4_v3 (NVIDIA T4)
 # 0.526 / 0.71 / 0.22; NV6ads_A10_v5 (1/6 NVIDIA A10) 0.454 / 0.73 / 0.13; NV4ads_V710_v5 (1/6 AMD V710)
 # 0.333 / 0.517 / 0.10; NV4as_v4 (1/8 AMD MI25) Windows Spot 0.08.
+# Guard job. A hosted job dies at 6 h: 5-hour boxes expire well inside the 345 minutes it allows itself, and it deletes at that mark anyway.
+GUARD_MAX_HOURS = 5
+GUARD_JOB_SECONDS = 345 * 60
+GUARD_POLL_SECONDS = 60
+GUARD_LOGIN_SECONDS = 20 * 60
+GUARD_PREP_SECONDS = 30 * 60    # the caller preps the box after the box job, so no idle file before then
+GUARD_BLIND_SECONDS = 10 * 60   # beyond the idle limit, how long the guard tolerates not being able to read the box
 GPU_MAX_HOURS = {'Standard_NC4as_T4_v3': 2, 'Standard_NV6ads_A10_v5': 2, 'Standard_NV4ads_V710_v5': 2,
                  'Standard_NV4as_v4': 2, 'Standard_NV8as_v4': 2}
 # Microsoft's GPU driver VM extensions (publisher Microsoft.HpcCompute), Windows boxes only: Linux GPU boxes take
@@ -259,15 +266,17 @@ def delete_resources(resources):
              'microsoft.network/networksecuritygroups': 4,
              'microsoft.network/virtualnetworks': 5}
     pending = sorted(resources, key=lambda r: order.get(r['type'].lower(), 6))
+    deleted = 0
     for attempt in range(3):
         failed = []
         for resource in pending:
             try:
                 az('resource', 'delete', '--ids', resource['id'])
-                print('Deleted ' + resource['name'])
+                deleted += 1
             except RuntimeError:
                 failed.append(resource)
         if not failed:
+            print('Deleted %d resources' % deleted)   # a count: this log is public
             return
         pending = failed
         if attempt < 2:
@@ -282,6 +291,10 @@ def down(name):
     if not any(r['name'] == name and r['type'].lower() == VM_TYPE and owned(r)
                for r in resources):
         raise ValidationError('Refusing deletion: VM must exist and have owner=agent')
+    remove_box(name, resources)
+
+
+def remove_box(name, resources):
     selected = [r for r in resources if owned(r) and
                 ((r.get('tags') or {}).get('box') == name or
                  (r['name'] == name and r['type'].lower() == VM_TYPE))]
@@ -317,18 +330,86 @@ def reap(now=None):
 
 
 def report_leftovers(boxes):
-    # Compliance (10-31): a box that held a game disc must leave no disk or snapshot behind. Names only.
+    # Compliance (10-31): a box that held a game disc must leave no disk or snapshot behind. Counts only: this log is public.
     # The resource list can lag a delete by seconds, so anything left is read once more before it counts.
     for attempt in range(2):
         left = [r for r in inventory() if r['type'].lower() in (DISK_TYPE, SNAPSHOT_TYPE)]
         if not left or attempt:
             break
         time.sleep(30)
-    print('Disks and snapshots left in the group: ' + (', '.join(sorted(r['name'] for r in left)) or 'none'))
+    print('Disks and snapshots left in the group: ' + (str(len(left)) if left else 'none'))
     stale = sorted(r['name'] for r in left if (r.get('tags') or {}).get('box') in boxes or
                    any(r['name'].startswith(b + '-') for b in boxes))
     if stale:
-        raise RuntimeError('A deleted box left a disk or snapshot behind: ' + ', '.join(stale))
+        raise RuntimeError('A deleted box left %d disk(s) or snapshot(s) behind' % len(stale))
+
+
+def read_idle(rg, name):
+    # Seconds since the box last saw activity, or None before its idle file exists. Clock and file both come from the box.
+    view = az('vm', 'run-command', 'invoke', *rg, '--name', name, '--command-id', 'RunShellScript',
+              '--scripts', 'date +%s; cat /run/yougame-idle/state 2>/dev/null || true', timeout=180)
+    body = view['value'][0]['message'].split('[stdout]')[-1].split('[stderr]')[0]
+    lines = [line for line in body.splitlines() if line.strip()]
+    return int(lines[0]) - int(json.loads(lines[1])['last_active']) if len(lines) > 1 else None
+
+
+def guard(inputs):
+    # One loop for the life of the box. Any failure is retried, because stopping here would leave the box to the reaper.
+    name = 'ygbox-' + inputs['label'] + '-' + os.environ['GITHUB_RUN_ID']
+    mask(name)
+    mask(inputs['dns_label'])
+    limit = int(inputs['idle_minutes']) * 60
+    rg = ['--resource-group', os.environ['AZURE_RESOURCE_GROUP']]
+    started = last_read = time.time()
+    logged_in = 0   # az cannot renew a federated login, so take a fresh OIDC token well inside its one-hour life
+    passes = 0
+    removing = None   # the reason, once a delete has started: "VM gone" then no longer means there is nothing left to do
+    while True:
+        passes += 1
+        try:
+            if time.time() - logged_in >= GUARD_LOGIN_SECONDS:
+                login()
+                logged_in = time.time()
+            resources = inventory()
+            vm = next((r for r in resources if r['name'] == name and r['type'].lower() == VM_TYPE and owned(r)), None)
+            if vm is None:
+                if removing:
+                    remove_box(name, resources)   # raises until nothing is left; the job ends red at its timeout if it never clears
+                    print('guard: removed, reason ' + removing, flush=True)
+                    return
+                print('guard: box already gone', flush=True)
+                return
+            now = time.time()
+            expires = timestamp((vm.get('tags') or {}).get('expires'))
+            reason = None
+            if now - started >= GUARD_JOB_SECONDS:
+                reason = 'job-limit'
+            elif expires and now >= expires.timestamp():
+                reason = 'hours'
+            else:
+                try:
+                    idle = read_idle(rg, name)
+                    last_read = time.time()
+                    if idle is None:
+                        reason = 'never-prepared' if now - started >= GUARD_PREP_SECONDS else None
+                    elif idle >= limit:
+                        reason = 'idle'
+                    elif passes % 10 == 1:
+                        print('guard: idle %ds' % idle, flush=True)
+                except (RuntimeError, ValueError, KeyError, IndexError, TypeError) as error:
+                    print('guard: no reading (' + type(error).__name__ + ')', flush=True)
+                    if time.time() - last_read >= limit + GUARD_BLIND_SECONDS:
+                        reason = 'no-status'
+            if reason:
+                print('guard: removing box, reason ' + reason, flush=True)
+                removing = reason
+                remove_box(name, resources)
+                print('guard: removed, reason ' + reason, flush=True)
+                return
+        except Exception as error:   # names the type only: this log is public
+            print('guard: retrying after ' + type(error).__name__, flush=True)
+            logged_in = 0
+        time.sleep(GUARD_POLL_SECONDS)
 
 
 def up(inputs):
@@ -365,6 +446,15 @@ def up(inputs):
         raise ValidationError('spot and gpu_driver must be true or false')
     if driver == 'true' and (size not in GPU_DRIVERS or not os_name.startswith('windows-')):
         raise ValidationError('gpu_driver needs a Windows box with a GPU size')
+    dns_label = inputs.get('dns_label') or ''
+    if dns_label and not re.fullmatch(r'yg[0-9a-f]{20}', dns_label):
+        raise ValidationError('Invalid dns_label')
+    if dns_label:
+        mask(dns_label)
+    idle_minutes = inputs.get('idle_minutes') or ''
+    if idle_minutes and not (dns_label and not os_name.startswith('windows-') and int(hours) <= GUARD_MAX_HOURS and
+                             re.fullmatch(r'[0-9]{1,3}', idle_minutes) and 5 <= int(idle_minutes) <= 120):
+        raise ValidationError('idle_minutes needs dns_label, a Linux box, 5-120 minutes and at most %d hours' % GUARD_MAX_HOURS)
     # Keep only key type/base64, never comments identifying its owner. Reject options.
     key_parts = key_file.read_text().strip().split()
     if len(key_file.read_text().strip().splitlines()) != 1 or len(key_parts) < 2:
@@ -375,6 +465,8 @@ def up(inputs):
     step('login')
     login()
     name = 'ygbox-' + label + '-' + os.environ['GITHUB_RUN_ID']
+    if dns_label:
+        mask(name)
     now = dt.datetime.now(UTC)
     expires = (now + dt.timedelta(hours=int(hours))).strftime('%Y-%m-%dT%H:%M:%SZ')
     tags = ['owner=agent', 'purpose=' + label, 'expires=' + expires,
@@ -404,7 +496,8 @@ def up(inputs):
            '--address-prefixes', '10.42.0.0/24', '--subnet-name', 'box',
            '--subnet-prefixes', '10.42.0.0/24')
         az('network', 'public-ip', 'create', '--name', name + '-ip', *common,
-           '--sku', 'Standard', '--allocation-method', 'Static', '--version', 'IPv4')
+           '--sku', 'Standard', '--allocation-method', 'Static', '--version', 'IPv4',
+           *(['--dns-name', dns_label] if dns_label else []))
         az('network', 'nic', 'create', '--name', name + '-nic', *common,
            '--vnet-name', name + '-vnet', '--subnet', 'box',
            '--network-security-group', name + '-nsg', '--public-ip-address', name + '-ip')
@@ -442,6 +535,8 @@ def up(inputs):
             except RuntimeError as error:
                 print('gpu_driver: FAILED ' + str(error), flush=True)
         ip = az('network', 'public-ip', 'show', *rg, '--name', name + '-ip')['ipAddress']
+        if dns_label:
+            mask(ip)
         step('ready')
     except Exception:
         # Delete even a partially provisioned VM and recover its untagged OS disk.
@@ -450,6 +545,8 @@ def up(inputs):
         selected = [r for r in resources if owned(r) and (r.get('tags') or {}).get('box') == name]
         delete_resources(selected + disk_companions(resources, {name}))
         raise
+    if dns_label:
+        return   # the caller knows the name (label + run id) and resolves the address itself
     output = {'name': name, 'public_ip': ip, 'os': os_name, 'expires': expires}
     for k, v in output.items():
         print(k + ': ' + v)
@@ -473,8 +570,11 @@ def main():
         # Check syntax before obtaining a token.
         if not re.fullmatch(r'ygbox-[a-z0-9-]+-[0-9]+', inputs['name']):
             raise ValidationError('Invalid box name')
+        mask(inputs['name'])
         login()
         down(inputs['name'])
+    elif sys.argv[1] == 'guard':
+        guard(inputs)
     elif sys.argv[1] == 'reap':
         login()
         reap()

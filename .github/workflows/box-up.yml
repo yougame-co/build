@@ -1,5 +1,5 @@
 name: Test box up
-run-name: Test box up (${{ inputs.label }})
+run-name: Test box up${{ inputs.dns_label == '' && format(' ({0})', inputs.label) || '' }}
 on:
   workflow_dispatch:
     inputs:
@@ -38,6 +38,14 @@ on:
         type: choice
         options: ['false', 'true']
         default: 'false'
+      dns_label:
+        description: Random DNS label (yg + 20 hex). When set, the box name and address stay out of this public log; resolve <label>.<region>.cloudapp.azure.com
+        type: string
+        default: ''
+      idle_minutes:
+        description: Linux with dns_label, at most 5 hours. Starts the guard job, which deletes the box at this idle limit or at expiry
+        type: string
+        default: ''
 
 concurrency:
   group: box-up-${{ inputs.label }}
@@ -53,10 +61,10 @@ jobs:
     timeout-minutes: 60
     environment: test-boxes
     env:
-      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
-      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
-      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
-      AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      AZURE_RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
       AZURE_CORE_COLLECT_TELEMETRY: 'false'
     outputs:
       name: ${{ steps.box.outputs.name }}
@@ -86,3 +94,26 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/test-boxes.py up
+
+  guard:
+    # Deletes the box at its idle or hours limit, whatever happens to the caller's machine. Starts once the box job succeeds.
+    needs: box
+    if: ${{ inputs.idle_minutes != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    environment: test-boxes
+    env:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      AZURE_RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
+      AZURE_CORE_COLLECT_TELEMETRY: 'false'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/test-boxes.py guard
